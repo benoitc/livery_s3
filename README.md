@@ -110,4 +110,4 @@ rebar3 ex_doc      # writes HTML to doc/
 
 ## License
 
-Apache-2.0
+Apache-2.0. Copyright 2026 Benoit Chesneau. See [LICENSE](LICENSE).

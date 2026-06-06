@@ -1,3 +1,5 @@
+%% SPDX-License-Identifier: Apache-2.0
+%% Copyright 2026 Benoit Chesneau
 -module(livery_s3).
 -moduledoc """
 An S3-compatible object storage client built on the livery client.

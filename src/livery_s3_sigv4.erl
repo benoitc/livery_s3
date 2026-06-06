@@ -1,3 +1,5 @@
+%% SPDX-License-Identifier: Apache-2.0
+%% Copyright 2026 Benoit Chesneau
 -module(livery_s3_sigv4).
 -moduledoc """
 AWS Signature Version 4 for S3, as a `livery_client` layer.

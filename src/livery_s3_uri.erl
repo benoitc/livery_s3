@@ -1,3 +1,5 @@
+%% SPDX-License-Identifier: Apache-2.0
+%% Copyright 2026 Benoit Chesneau
 -module(livery_s3_uri).
 -moduledoc """
 URL building and RFC 3986 encoding for S3 requests.

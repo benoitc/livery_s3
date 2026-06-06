@@ -1,3 +1,6 @@
+%% SPDX-License-Identifier: Apache-2.0
+%% Copyright 2026 Benoit Chesneau
+%%
 %% Shared definitions for livery_s3.
 
 %% SigV4 / S3 constants.

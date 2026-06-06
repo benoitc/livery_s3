@@ -1,3 +1,5 @@
+%% SPDX-License-Identifier: Apache-2.0
+%% Copyright 2026 Benoit Chesneau
 -module(livery_s3_xml).
 -moduledoc """
 Minimal XML parsing for S3 responses.
