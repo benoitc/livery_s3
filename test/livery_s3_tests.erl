@@ -577,7 +577,13 @@ all_ops_network_error_test() ->
             livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>, [{1, <<"e">>}])
         end,
         fun(C) -> livery_s3:abort_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>) end,
-        fun(C) -> livery_s3:delete_objects(C, <<"b">>, [<<"k">>]) end
+        fun(C) -> livery_s3:delete_objects(C, <<"b">>, [<<"k">>]) end,
+        fun(C) -> livery_s3:get_bucket_location(C, <<"b">>) end,
+        fun(C) -> livery_s3:list_parts(C, <<"b">>, <<"k">>, <<"u">>) end,
+        fun(C) -> livery_s3:list_multipart_uploads(C, <<"b">>) end,
+        fun(C) ->
+            livery_s3:upload_part_copy(C, <<"b">>, <<"k">>, <<"u">>, 1, <<"sb">>, <<"sk">>)
+        end
     ],
     lists:foreach(
         fun(Op) ->
@@ -586,6 +592,147 @@ all_ops_network_error_test() ->
         end,
         Ops
     ).
+
+%%====================================================================
+%% Conditional requests, response overrides, MD5
+%%====================================================================
+
+get_object_conditional_headers_test() ->
+    {Req, _} = run(resp(200, [], <<"x">>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{
+            if_none_match => <<"\"e\"">>, if_modified_since => <<"Mon, 01 Jan 2020 00:00:00 GMT">>
+        })
+    end),
+    H = maps:get(headers, Req),
+    ?assertEqual(<<"\"e\"">>, header(<<"if-none-match">>, H)),
+    ?assertEqual(<<"Mon, 01 Jan 2020 00:00:00 GMT">>, header(<<"if-modified-since">>, H)).
+
+get_object_not_modified_test() ->
+    {_, R} = run(resp(304, [], <<>>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{if_none_match => <<"\"e\"">>})
+    end),
+    ?assertEqual({error, not_modified}, R).
+
+get_object_precondition_failed_test() ->
+    {_, R} = run(resp(412, [], <<>>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{if_match => <<"\"e\"">>})
+    end),
+    ?assertEqual({error, precondition_failed}, R).
+
+head_object_not_modified_test() ->
+    {_, R} = run(resp(304, [], <<>>), fun(C) ->
+        livery_s3:head_object(C, <<"b">>, <<"k">>, #{if_none_match => <<"\"e\"">>})
+    end),
+    ?assertEqual({error, not_modified}, R).
+
+put_object_if_none_match_test() ->
+    {Req, _} = run(resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>, #{if_none_match => <<"*">>})
+    end),
+    ?assertEqual(<<"*">>, header(<<"if-none-match">>, maps:get(headers, Req))).
+
+put_object_precondition_failed_test() ->
+    {_, R} = run(resp(412, [], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>, #{if_none_match => <<"*">>})
+    end),
+    ?assertEqual({error, precondition_failed}, R).
+
+put_object_content_md5_test() ->
+    {Req, _} = run(resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"hello">>, #{content_md5 => true})
+    end),
+    Expected = base64:encode(crypto:hash(md5, <<"hello">>)),
+    ?assertEqual(Expected, header(<<"content-md5">>, maps:get(headers, Req))).
+
+get_object_response_overrides_test() ->
+    {Req, _} = run(resp(200, [], <<"x">>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{response_content_type => <<"application/xml">>})
+    end),
+    ?assert(
+        binary:match(maps:get(url, Req), <<"response-content-type=application%2Fxml">>) =/= nomatch
+    ).
+
+presign_response_override_test() ->
+    C = client(resp(200, [], <<>>)),
+    {ok, Url} = livery_s3:presign(C, get, <<"b">>, <<"k">>, 300, #{
+        response_content_disposition => <<"attachment">>
+    }),
+    ?assert(binary:match(Url, <<"response-content-disposition=attachment">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"X-Amz-Signature=">>) =/= nomatch).
+
+%%====================================================================
+%% Bucket location, copy source versioning
+%%====================================================================
+
+get_bucket_location_test() ->
+    {Req, R} = run(resp(200, [], <<"<LocationConstraint>eu-west-1</LocationConstraint>">>), fun(C) ->
+        livery_s3:get_bucket_location(C, <<"b">>)
+    end),
+    ?assert(binary:match(maps:get(url, Req), <<"location=">>) =/= nomatch),
+    ?assertEqual({ok, <<"eu-west-1">>}, R).
+
+get_bucket_location_default_test() ->
+    {_, R} = run(resp(200, [], <<"<LocationConstraint/>">>), fun(C) ->
+        livery_s3:get_bucket_location(C, <<"b">>)
+    end),
+    ?assertEqual({ok, <<"us-east-1">>}, R).
+
+copy_object_source_version_test() ->
+    Xml = <<"<CopyObjectResult><ETag>\"c\"</ETag></CopyObjectResult>">>,
+    {Req, _} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:copy_object(C, <<"s">>, <<"a">>, <<"d">>, <<"b">>, #{version_id => <<"V1">>})
+    end),
+    ?assertEqual(<<"/s/a?versionId=V1">>, header(<<"x-amz-copy-source">>, maps:get(headers, Req))).
+
+%%====================================================================
+%% Multipart: list_parts, list_multipart_uploads, upload_part_copy
+%%====================================================================
+
+list_parts_test() ->
+    Xml = <<
+        "<ListPartsResult><IsTruncated>false</IsTruncated>"
+        "<Part><PartNumber>1</PartNumber><ETag>\"p1\"</ETag><Size>5242880</Size>"
+        "<LastModified>2020-01-01T00:00:00Z</LastModified></Part></ListPartsResult>"
+    >>,
+    {Req, {ok, Map}} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:list_parts(C, <<"b">>, <<"k">>, <<"U1">>, #{max_parts => 100})
+    end),
+    Url = maps:get(url, Req),
+    ?assert(binary:match(Url, <<"uploadId=U1">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"max-parts=100">>) =/= nomatch),
+    [P] = maps:get(parts, Map),
+    ?assertEqual(1, maps:get(part_number, P)),
+    ?assertEqual(<<"p1">>, maps:get(etag, P)),
+    ?assertEqual(5242880, maps:get(size, P)).
+
+list_multipart_uploads_test() ->
+    Xml = <<
+        "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>"
+        "<Upload><Key>k</Key><UploadId>U1</UploadId>"
+        "<Initiated>2020-01-01T00:00:00Z</Initiated></Upload></ListMultipartUploadsResult>"
+    >>,
+    {Req, {ok, Map}} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:list_multipart_uploads(C, <<"b">>, #{prefix => <<"k">>})
+    end),
+    ?assert(binary:match(maps:get(url, Req), <<"uploads=">>) =/= nomatch),
+    [U] = maps:get(uploads, Map),
+    ?assertEqual(<<"k">>, maps:get(key, U)),
+    ?assertEqual(<<"U1">>, maps:get(upload_id, U)).
+
+upload_part_copy_test() ->
+    Xml = <<"<CopyPartResult><ETag>\"cp\"</ETag></CopyPartResult>">>,
+    {Req, R} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:upload_part_copy(C, <<"b">>, <<"k">>, <<"U1">>, 2, <<"src">>, <<"o">>, #{
+            range => {0, 99}
+        })
+    end),
+    H = maps:get(headers, Req),
+    ?assertEqual(<<"/src/o">>, header(<<"x-amz-copy-source">>, H)),
+    ?assertEqual(<<"bytes=0-99">>, header(<<"x-amz-copy-source-range">>, H)),
+    Url = maps:get(url, Req),
+    ?assert(binary:match(Url, <<"partNumber=2">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"uploadId=U1">>) =/= nomatch),
+    ?assertEqual({ok, #{etag => <<"cp">>}}, R).
 
 %%====================================================================
 %% Helpers

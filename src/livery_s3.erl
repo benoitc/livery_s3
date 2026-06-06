@@ -43,7 +43,7 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 %% Buckets.
 -export([list_buckets/1]).
 -export([create_bucket/2, create_bucket/3]).
--export([delete_bucket/2, head_bucket/2]).
+-export([delete_bucket/2, head_bucket/2, get_bucket_location/2]).
 -export([list_objects/2, list_objects/3, list_objects_all/2, list_objects_all/3]).
 %% Versioning.
 -export([
@@ -55,6 +55,8 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 %% Multipart.
 -export([create_multipart_upload/3, create_multipart_upload/4]).
 -export([upload_part/6, complete_multipart_upload/5, abort_multipart_upload/4]).
+-export([upload_part_copy/7, upload_part_copy/8]).
+-export([list_parts/4, list_parts/5, list_multipart_uploads/2, list_multipart_uploads/3]).
 %% Batch delete.
 -export([delete_objects/3]).
 
@@ -67,7 +69,12 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 }).
 
 -opaque client() :: #s3_client{}.
--type reason() :: not_found | {s3, binary(), binary(), map()} | term().
+-type reason() ::
+    not_found
+    | not_modified
+    | precondition_failed
+    | {s3, binary(), binary(), map()}
+    | term().
 -type bucket() :: binary().
 -type key() :: binary().
 -type body() :: iodata() | {full, iodata()} | {stream, fun(() -> eof | {ok, binary(), fun()})}.
@@ -125,15 +132,16 @@ presign(Client, Method, Bucket, Key, Expires) ->
     presign(Client, Method, Bucket, Key, Expires, #{}).
 
 -doc """
-Generate a presigned URL. `Opts` may carry `version_id`. The URL signs only the
-`host` header with an `UNSIGNED-PAYLOAD`, so it can be used directly by a
-browser or any HTTP client.
+Generate a presigned URL. `Opts` may carry `version_id` and the
+`response_content_*` overrides (e.g. force a download filename). The URL signs
+only the `host` header with an `UNSIGNED-PAYLOAD`, so it can be used directly by
+a browser or any HTTP client.
 """.
 -spec presign(client(), atom() | binary(), bucket(), key(), pos_integer(), map()) ->
     {ok, binary()}.
 presign(#s3_client{config = Cfg}, Method, Bucket, Key, Expires, Opts) ->
     {DateTime, Date} = livery_s3_sigv4:now_timestamps(),
-    Extra = version_query(Opts),
+    Extra = version_query(Opts) ++ response_query(Opts),
     {ok, livery_s3_sigv4:presigned_url(Cfg, Method, Bucket, Key, Expires, Extra, DateTime, Date)}.
 
 %%====================================================================
@@ -149,13 +157,25 @@ put_object(Client, Bucket, Key, Body) ->
 Upload an object with options: `content_type`, `cache_control`,
 `content_disposition`, `content_encoding`, `storage_class`, `acl`, and
 `metadata` (`#{Name => Value}` mapped to `x-amz-meta-*`).
+
+Conditional writes (backend-dependent): `if_none_match => <<"*">>` puts only if
+the object does not exist, `if_match => ETag` only if it matches; a failed
+precondition yields `{error, precondition_failed}`. `content_md5 => true` adds a
+base64 `Content-MD5` integrity header (full-body uploads only).
 """.
 -spec put_object(client(), bucket(), key(), body(), map()) -> {ok, map()} | {error, reason()}.
 put_object(Client, Bucket, Key, Body, Opts) ->
-    Headers = object_write_headers(Opts),
-    case request(Client, put, Bucket, Key, [], Headers, to_body(Body), #{}) of
-        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, write_result(R)} end);
-        {error, _} = E -> E
+    Body1 = to_body(Body),
+    Headers = object_write_headers(Opts) ++ conditional_headers(Opts) ++ md5_headers(Opts, Body1),
+    case request(Client, put, Bucket, Key, [], Headers, Body1, #{}) of
+        {ok, Resp} ->
+            case livery_client:status(Resp) of
+                S when S >= 200, S < 300 -> {ok, write_result(Resp)};
+                412 -> {error, precondition_failed};
+                _ -> decode_error(Resp)
+            end;
+        {error, _} = E ->
+            E
     end.
 
 -doc "Download an object. See `get_object/4`.".
@@ -170,6 +190,12 @@ Download an object. `Opts`:
 * `version_id` - read a specific version.
 * `stream` - when `true`, the result's `body` is a `{stream, Reader}` to drain
   with `livery_client:read/2`; otherwise it is the full binary.
+* conditional headers `if_match`, `if_none_match`, `if_modified_since`,
+  `if_unmodified_since`; a `304` yields `{error, not_modified}` and a `412`
+  yields `{error, precondition_failed}`.
+* response-header overrides `response_content_type`, `response_content_disposition`,
+  `response_cache_control`, `response_content_encoding`, `response_content_language`,
+  `response_expires`.
 
 The result map carries `body`, `metadata`, and (when present) `content_type`,
 `content_length`, `etag`, `last_modified`, `version_id`.
@@ -177,12 +203,14 @@ The result map carries `body`, `metadata`, and (when present) `content_type`,
 -spec get_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 get_object(Client, Bucket, Key, Opts) ->
     Stream = maps:get(stream, Opts, false),
-    Headers = range_headers(Opts),
-    Query = version_query(Opts),
+    Headers = range_headers(Opts) ++ conditional_headers(Opts),
+    Query = version_query(Opts) ++ response_query(Opts),
     case request(Client, get, Bucket, Key, Query, Headers, empty, #{stream => Stream}) of
         {ok, Resp} ->
             case livery_client:status(Resp) of
                 S when S =:= 200; S =:= 206 -> {ok, read_result(Resp, Stream)};
+                304 -> {error, not_modified};
+                412 -> {error, precondition_failed};
                 _ -> decode_error(Resp)
             end;
         {error, _} = E ->
@@ -194,14 +222,21 @@ get_object(Client, Bucket, Key, Opts) ->
 head_object(Client, Bucket, Key) ->
     head_object(Client, Bucket, Key, #{}).
 
--doc "Fetch object metadata. `Opts` may carry `version_id`.".
+-doc """
+Fetch object metadata. `Opts` may carry `version_id` and the same conditional
+headers as `get_object/4` (`304` -> `not_modified`, `412` ->
+`precondition_failed`).
+""".
 -spec head_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 head_object(Client, Bucket, Key, Opts) ->
     Query = version_query(Opts),
-    case request(Client, head, Bucket, Key, Query, [], empty, #{}) of
+    Headers = conditional_headers(Opts),
+    case request(Client, head, Bucket, Key, Query, Headers, empty, #{}) of
         {ok, Resp} ->
             case livery_client:status(Resp) of
                 200 -> {ok, object_meta(Resp)};
+                304 -> {error, not_modified};
+                412 -> {error, precondition_failed};
                 404 -> {error, not_found};
                 _ -> decode_error(Resp)
             end;
@@ -232,8 +267,10 @@ directive to `REPLACE`.
 -spec copy_object(client(), bucket(), key(), bucket(), key(), map()) ->
     {ok, map()} | {error, reason()}.
 copy_object(Client, SrcBucket, SrcKey, DstBucket, DstKey, Opts) ->
-    Source = <<"/", SrcBucket/binary, "/", (livery_s3_uri:encode_path(SrcKey))/binary>>,
-    Headers0 = [{<<"x-amz-copy-source">>, Source} | object_write_headers(Opts)],
+    Headers0 = [
+        {<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)}
+        | object_write_headers(Opts)
+    ],
     Headers =
         case maps:is_key(metadata, Opts) of
             true -> [{<<"x-amz-metadata-directive">>, <<"REPLACE">>} | Headers0];
@@ -287,6 +324,19 @@ head_bucket(Client, Bucket) ->
                 404 -> {error, not_found};
                 _ -> decode_error(Resp)
             end;
+        {error, _} = E ->
+            E
+    end.
+
+-doc "Return the bucket's region. An empty `LocationConstraint` maps to `us-east-1`.".
+-spec get_bucket_location(client(), bucket()) -> {ok, binary()} | {error, reason()}.
+get_bucket_location(Client, Bucket) ->
+    case request(Client, get, Bucket, undefined, [{<<"location">>, <<>>}], [], empty, #{}) of
+        {ok, Resp} ->
+            on_2xx(Resp, fun(R) ->
+                {ok, Tree} = parse_body(R),
+                {ok, location_region(livery_s3_xml:node_text(Tree))}
+            end);
         {error, _} = E ->
             E
     end.
@@ -449,6 +499,70 @@ complete_multipart_upload(Client, Bucket, Key, UploadId, Parts) ->
 abort_multipart_upload(Client, Bucket, Key, UploadId) ->
     Query = [{<<"uploadId">>, UploadId}],
     expect_ok(request(Client, delete, Bucket, Key, Query, [], empty, #{})).
+
+-doc "Upload a part by copying from an existing object. See `upload_part_copy/8`.".
+-spec upload_part_copy(client(), bucket(), key(), binary(), pos_integer(), bucket(), key()) ->
+    {ok, map()} | {error, reason()}.
+upload_part_copy(Client, Bucket, Key, UploadId, PartNumber, SrcBucket, SrcKey) ->
+    upload_part_copy(Client, Bucket, Key, UploadId, PartNumber, SrcBucket, SrcKey, #{}).
+
+-doc """
+Upload a part by server-side copy from `SrcBucket/SrcKey`. `Opts`: `range =>
+{Start, End}` copies a byte range of the source; `version_id` selects a source
+version. Returns `#{etag => _}`.
+""".
+-spec upload_part_copy(
+    client(), bucket(), key(), binary(), pos_integer(), bucket(), key(), map()
+) -> {ok, map()} | {error, reason()}.
+upload_part_copy(Client, Bucket, Key, UploadId, PartNumber, SrcBucket, SrcKey, Opts) ->
+    Headers0 = [{<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)}],
+    Headers =
+        case maps:get(range, Opts, undefined) of
+            undefined -> Headers0;
+            {Start, End} -> [{<<"x-amz-copy-source-range">>, range_value(Start, End)} | Headers0]
+        end,
+    Query = [{<<"partNumber">>, integer_to_binary(PartNumber)}, {<<"uploadId">>, UploadId}],
+    case request(Client, put, Bucket, Key, Query, Headers, empty, #{}) of
+        {ok, Resp} -> on_result_xml(Resp, <<"CopyPartResult">>, fun copy_part_result/2);
+        {error, _} = E -> E
+    end.
+
+-doc "List the parts uploaded so far for a multipart upload. See `list_parts/5`.".
+-spec list_parts(client(), bucket(), key(), binary()) -> {ok, map()} | {error, reason()}.
+list_parts(Client, Bucket, Key, UploadId) ->
+    list_parts(Client, Bucket, Key, UploadId, #{}).
+
+-doc """
+List uploaded parts. `Opts`: `max_parts`, `part_number_marker`. Result: `parts`
+(`#{part_number, etag, size, last_modified}`), `is_truncated`,
+`next_part_number_marker`.
+""".
+-spec list_parts(client(), bucket(), key(), binary(), map()) -> {ok, map()} | {error, reason()}.
+list_parts(Client, Bucket, Key, UploadId, Opts) ->
+    Query = [{<<"uploadId">>, UploadId} | parts_query(Opts)],
+    case request(Client, get, Bucket, Key, Query, [], empty, #{}) of
+        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_parts(R)} end);
+        {error, _} = E -> E
+    end.
+
+-doc "List in-progress multipart uploads in a bucket. See `list_multipart_uploads/3`.".
+-spec list_multipart_uploads(client(), bucket()) -> {ok, map()} | {error, reason()}.
+list_multipart_uploads(Client, Bucket) ->
+    list_multipart_uploads(Client, Bucket, #{}).
+
+-doc """
+List in-progress multipart uploads. `Opts`: `prefix`, `delimiter`, `max_uploads`,
+`key_marker`, `upload_id_marker`. Result: `uploads`
+(`#{key, upload_id, initiated}`), `common_prefixes`, `is_truncated`,
+`next_key_marker`, `next_upload_id_marker`.
+""".
+-spec list_multipart_uploads(client(), bucket(), map()) -> {ok, map()} | {error, reason()}.
+list_multipart_uploads(Client, Bucket, Opts) ->
+    Query = [{<<"uploads">>, <<>>} | uploads_query(Opts)],
+    case request(Client, get, Bucket, undefined, Query, [], empty, #{}) of
+        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_multipart_uploads(R)} end);
+        {error, _} = E -> E
+    end.
 
 %%====================================================================
 %% Batch delete
@@ -731,6 +845,55 @@ complete_result(Tree, Resp) ->
     },
     add_version(Base, Resp).
 
+-spec copy_part_result(livery_s3_xml:tree(), livery_client:response()) -> map().
+copy_part_result(Tree, _Resp) ->
+    #{etag => unquote(default(livery_s3_xml:text(Tree, <<"ETag">>), <<>>))}.
+
+-spec parse_parts(livery_client:response()) -> map().
+parse_parts(Resp) ->
+    {ok, Tree} = parse_body(Resp),
+    Parts = [
+        #{
+            part_number => to_int(livery_s3_xml:text(N, <<"PartNumber">>)),
+            etag => unquote(default(livery_s3_xml:text(N, <<"ETag">>), <<>>)),
+            size => to_int(livery_s3_xml:text(N, <<"Size">>)),
+            last_modified => livery_s3_xml:text(N, <<"LastModified">>)
+        }
+     || N <- livery_s3_xml:children(Tree, <<"Part">>)
+    ],
+    #{
+        parts => Parts,
+        is_truncated => to_bool(livery_s3_xml:text(Tree, <<"IsTruncated">>)),
+        next_part_number_marker => livery_s3_xml:text(Tree, <<"NextPartNumberMarker">>)
+    }.
+
+-spec parse_multipart_uploads(livery_client:response()) -> map().
+parse_multipart_uploads(Resp) ->
+    {ok, Tree} = parse_body(Resp),
+    Uploads = [
+        #{
+            key => livery_s3_xml:text(N, <<"Key">>),
+            upload_id => livery_s3_xml:text(N, <<"UploadId">>),
+            initiated => livery_s3_xml:text(N, <<"Initiated">>)
+        }
+     || N <- livery_s3_xml:children(Tree, <<"Upload">>)
+    ],
+    Prefixes = [
+        livery_s3_xml:text(N, <<"Prefix">>)
+     || N <- livery_s3_xml:children(Tree, <<"CommonPrefixes">>)
+    ],
+    #{
+        uploads => Uploads,
+        common_prefixes => Prefixes,
+        is_truncated => to_bool(livery_s3_xml:text(Tree, <<"IsTruncated">>)),
+        next_key_marker => livery_s3_xml:text(Tree, <<"NextKeyMarker">>),
+        next_upload_id_marker => livery_s3_xml:text(Tree, <<"NextUploadIdMarker">>)
+    }.
+
+-spec location_region(binary()) -> binary().
+location_region(<<>>) -> <<"us-east-1">>;
+location_region(Region) -> Region.
+
 -spec versioning_status(undefined | binary()) -> enabled | suspended | none.
 versioning_status(<<"Enabled">>) -> enabled;
 versioning_status(<<"Suspended">>) -> suspended;
@@ -788,6 +951,60 @@ version_query(Opts) ->
         undefined -> [];
         V -> [{<<"versionId">>, V}]
     end.
+
+-spec conditional_headers(map()) -> [{binary(), binary()}].
+conditional_headers(Opts) ->
+    lists:append([
+        opt_header(<<"if-match">>, if_match, Opts),
+        opt_header(<<"if-none-match">>, if_none_match, Opts),
+        opt_header(<<"if-modified-since">>, if_modified_since, Opts),
+        opt_header(<<"if-unmodified-since">>, if_unmodified_since, Opts)
+    ]).
+
+-spec response_query(map()) -> [{binary(), binary()}].
+response_query(Opts) ->
+    lists:append([
+        opt_query(<<"response-content-type">>, response_content_type, Opts),
+        opt_query(<<"response-content-disposition">>, response_content_disposition, Opts),
+        opt_query(<<"response-cache-control">>, response_cache_control, Opts),
+        opt_query(<<"response-content-encoding">>, response_content_encoding, Opts),
+        opt_query(<<"response-content-language">>, response_content_language, Opts),
+        opt_query(<<"response-expires">>, response_expires, Opts)
+    ]).
+
+-spec md5_headers(map(), {full, iodata()} | {stream, fun()}) -> [{binary(), binary()}].
+md5_headers(Opts, {full, Data}) ->
+    case maps:get(content_md5, Opts, false) of
+        true -> [{<<"content-md5">>, base64:encode(crypto:hash(md5, Data))}];
+        _ -> []
+    end;
+md5_headers(_Opts, _Body) ->
+    [].
+
+-spec copy_source(bucket(), key(), map()) -> binary().
+copy_source(SrcBucket, SrcKey, Opts) ->
+    Base = <<"/", SrcBucket/binary, "/", (livery_s3_uri:encode_path(SrcKey))/binary>>,
+    case maps:get(version_id, Opts, undefined) of
+        undefined -> Base;
+        V -> <<Base/binary, "?versionId=", V/binary>>
+    end.
+
+-spec uploads_query(map()) -> [{binary(), binary()}].
+uploads_query(Opts) ->
+    lists:append([
+        opt_query(<<"prefix">>, prefix, Opts),
+        opt_query(<<"delimiter">>, delimiter, Opts),
+        opt_query(<<"key-marker">>, key_marker, Opts),
+        opt_query(<<"upload-id-marker">>, upload_id_marker, Opts),
+        int_query(<<"max-uploads">>, max_uploads, Opts)
+    ]).
+
+-spec parts_query(map()) -> [{binary(), binary()}].
+parts_query(Opts) ->
+    lists:append([
+        int_query(<<"max-parts">>, max_parts, Opts),
+        int_query(<<"part-number-marker">>, part_number_marker, Opts)
+    ]).
 
 -spec list_query(map()) -> [{binary(), binary()}].
 list_query(Opts) ->

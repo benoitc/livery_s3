@@ -31,6 +31,24 @@ returned as a `metadata` map alongside `content_type`, `content_length`,
   drain it with `livery_client:read/2` or `read_body/1`.
 - Uploads accept a streaming body: pass `{stream, Producer}` as the body.
 
+## Conditional requests and integrity
+
+- `get_object/4` and `head_object/4` accept `if_match`, `if_none_match`,
+  `if_modified_since`, `if_unmodified_since`. A `304` becomes
+  `{error, not_modified}` and a `412` becomes `{error, precondition_failed}`.
+- `put_object/5` accepts `if_match` / `if_none_match` for conditional writes
+  (e.g. `if_none_match => <<"*">>` for create-if-absent); enforcement is
+  backend-dependent (AWS and MinIO enforce it, Garage currently does not).
+- `put_object/5` with `content_md5 => true` adds a base64 `Content-MD5`
+  integrity header (full-body uploads).
+
+## Response-header overrides
+
+`get_object/4` and `presign/6` accept `response_content_type`,
+`response_content_disposition`, `response_cache_control`,
+`response_content_encoding`, `response_content_language`, `response_expires`
+(e.g. force a download filename on a presigned URL).
+
 ## Buckets
 
 | Operation | Function |
@@ -39,6 +57,7 @@ returned as a `metadata` map alongside `content_type`, `content_length`,
 | Create | `create_bucket/2,3` |
 | Delete | `delete_bucket/2` |
 | Exists | `head_bucket/2` |
+| Region | `get_bucket_location/2` |
 | List objects (V2) | `list_objects/2,3` |
 | List all (paginated) | `list_objects_all/2,3` |
 
@@ -65,6 +84,9 @@ return `{error, {s3, <<"NotImplemented">>, _, _}}` rather than crashing.
 `abort_multipart_upload/4`. Pass the `{PartNumber, ETag}` pairs returned by
 `upload_part/6` to `complete_multipart_upload/5`.
 
+Also: `upload_part_copy/7,8` (server-side copy a whole object or byte range as a
+part), `list_parts/4,5`, and `list_multipart_uploads/2,3`.
+
 ## Batch delete
 
 `delete_objects/3` removes up to 1000 keys in one request. Keys are `Key`
@@ -74,7 +96,8 @@ binaries or `{Key, VersionId}` tuples; the result is
 ## Presigned URLs
 
 `presign/5,6` returns a time-limited URL (query-string SigV4, `host` the only
-signed header). Works for any method; `Opts` may carry `version_id`.
+signed header). Works for any method; `Opts` may carry `version_id` and the
+`response_content_*` overrides.
 
 ## Addressing and compatibility
 
