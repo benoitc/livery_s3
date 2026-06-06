@@ -1,0 +1,20 @@
+_build/
+.rebar3/
+rebar.lock
+*.beam
+*.plt
+erl_crash.dump
+*.crashdump
+.eunit/
+logs/
+.DS_Store
+
+# ex_doc generated output (markdown sources live under docs/)
+doc/
+
+# Local dep overrides (symlinks to sibling projects)
+_checkouts/
+
+.idea/
+*.iml
+.erlang.cookie

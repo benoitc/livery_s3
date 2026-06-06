@@ -1,0 +1,648 @@
+-module(livery_s3_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%%====================================================================
+%% Objects
+%%====================================================================
+
+put_object_test() ->
+    Resp = resp(200, [{<<"ETag">>, <<"\"abc\"">>}, {<<"x-amz-version-id">>, <<"v1">>}], <<>>),
+    {Req, Result} = run(Resp, fun(C) ->
+        livery_s3:put_object(C, <<"bucket">>, <<"key">>, <<"data">>, #{
+            content_type => <<"text/plain">>,
+            metadata => #{<<"foo">> => <<"bar">>}
+        })
+    end),
+    ?assertEqual(put, maps:get(method, Req)),
+    ?assertEqual(<<"https://s3.example.com/bucket/key">>, maps:get(url, Req)),
+    ?assertEqual({full, <<"data">>}, maps:get(body, Req)),
+    Headers = maps:get(headers, Req),
+    ?assertEqual(<<"text/plain">>, header(<<"content-type">>, Headers)),
+    ?assertEqual(<<"bar">>, header(<<"x-amz-meta-foo">>, Headers)),
+    ?assertEqual(<<"s3.example.com">>, header(<<"host">>, Headers)),
+    ?assertNotEqual(undefined, header(<<"authorization">>, Headers)),
+    ?assertNotEqual(undefined, header(<<"x-amz-content-sha256">>, Headers)),
+    ?assertEqual({ok, #{etag => <<"abc">>, version_id => <<"v1">>}}, Result).
+
+get_object_with_range_test() ->
+    Headers = [
+        {<<"Content-Type">>, <<"text/plain">>},
+        {<<"Content-Length">>, <<"5">>},
+        {<<"ETag">>, <<"\"e\"">>},
+        {<<"x-amz-meta-foo">>, <<"bar">>}
+    ],
+    Resp = resp(206, Headers, <<"hello">>),
+    {Req, Result} = run(Resp, fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{range => {0, 4}})
+    end),
+    ?assertEqual(get, maps:get(method, Req)),
+    ?assertEqual(<<"bytes=0-4">>, header(<<"range">>, maps:get(headers, Req))),
+    {ok, Map} = Result,
+    ?assertEqual(<<"hello">>, maps:get(body, Map)),
+    ?assertEqual(#{<<"foo">> => <<"bar">>}, maps:get(metadata, Map)),
+    ?assertEqual(5, maps:get(content_length, Map)),
+    ?assertEqual(<<"e">>, maps:get(etag, Map)),
+    ?assertEqual(<<"text/plain">>, maps:get(content_type, Map)).
+
+get_object_range_forms_test() ->
+    [
+        ?assertEqual(Expected, range_header_for(Range))
+     || {Range, Expected} <- [
+            {{10, 20}, <<"bytes=10-20">>},
+            {{100, eof}, <<"bytes=100-">>},
+            {{suffix, 50}, <<"bytes=-50">>}
+        ]
+    ].
+
+head_object_not_found_test() ->
+    {_, Result} = run(resp(404, [], <<>>), fun(C) ->
+        livery_s3:head_object(C, <<"b">>, <<"missing">>)
+    end),
+    ?assertEqual({error, not_found}, Result).
+
+delete_object_versioned_test() ->
+    {Req, Result} = run(resp(204, [], <<>>), fun(C) ->
+        livery_s3:delete_object(C, <<"b">>, <<"k">>, #{version_id => <<"v1">>})
+    end),
+    ?assertEqual(delete, maps:get(method, Req)),
+    ?assertEqual(<<"https://s3.example.com/b/k?versionId=v1">>, maps:get(url, Req)),
+    ?assertEqual(ok, Result).
+
+error_decoding_test() ->
+    Xml = <<
+        "<Error><Code>AccessDenied</Code><Message>Denied</Message>"
+        "<RequestId>R1</RequestId></Error>"
+    >>,
+    {_, Result} = run(resp(403, [], Xml), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>)
+    end),
+    ?assertMatch({error, {s3, <<"AccessDenied">>, <<"Denied">>, #{status := 403}}}, Result).
+
+copy_object_success_test() ->
+    Xml = <<"<CopyObjectResult><ETag>\"copied\"</ETag></CopyObjectResult>">>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:copy_object(C, <<"src">>, <<"a.txt">>, <<"dst">>, <<"b.txt">>)
+    end),
+    ?assertEqual(<<"/src/a.txt">>, header(<<"x-amz-copy-source">>, maps:get(headers, Req))),
+    ?assertEqual({ok, #{etag => <<"copied">>}}, Result).
+
+copy_object_inline_error_test() ->
+    %% S3 may return 200 with an <Error> body for CopyObject.
+    Xml = <<"<Error><Code>InternalError</Code><Message>retry</Message></Error>">>,
+    {_, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:copy_object(C, <<"src">>, <<"a">>, <<"dst">>, <<"b">>)
+    end),
+    ?assertMatch({error, {s3, <<"InternalError">>, _, _}}, Result).
+
+%%====================================================================
+%% Buckets
+%%====================================================================
+
+list_objects_test() ->
+    Xml = <<
+        "<ListBucketResult><IsTruncated>false</IsTruncated>"
+        "<Contents><Key>a.txt</Key><Size>10</Size><ETag>\"x\"</ETag></Contents>"
+        "<CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes></ListBucketResult>"
+    >>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:list_objects(C, <<"b">>, #{prefix => <<"p/">>, max_keys => 10})
+    end),
+    ?assertEqual(
+        <<"https://s3.example.com/b?list-type=2&max-keys=10&prefix=p%2F">>, maps:get(url, Req)
+    ),
+    {ok, Map} = Result,
+    ?assertEqual(false, maps:get(is_truncated, Map)),
+    [Obj] = maps:get(objects, Map),
+    ?assertEqual(<<"a.txt">>, maps:get(key, Obj)),
+    ?assertEqual(10, maps:get(size, Obj)),
+    ?assertEqual(<<"x">>, maps:get(etag, Obj)),
+    ?assertEqual([<<"p/">>], maps:get(common_prefixes, Map)).
+
+list_buckets_test() ->
+    Xml = <<
+        "<ListAllMyBucketsResult><Buckets>"
+        "<Bucket><Name>one</Name><CreationDate>2020-01-01T00:00:00Z</CreationDate></Bucket>"
+        "</Buckets></ListAllMyBucketsResult>"
+    >>,
+    {Req, Result} = run(resp(200, [], Xml), fun livery_s3:list_buckets/1),
+    ?assertEqual(<<"https://s3.example.com/">>, maps:get(url, Req)),
+    ?assertEqual({ok, [#{name => <<"one">>, creation_date => <<"2020-01-01T00:00:00Z">>}]}, Result).
+
+head_bucket_ok_test() ->
+    {_, Result} = run(resp(200, [], <<>>), fun(C) -> livery_s3:head_bucket(C, <<"b">>) end),
+    ?assertEqual(ok, Result).
+
+%%====================================================================
+%% Versioning
+%%====================================================================
+
+get_bucket_versioning_test() ->
+    Xml = <<"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>">>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:get_bucket_versioning(C, <<"b">>)
+    end),
+    ?assertEqual(<<"https://s3.example.com/b?versioning=">>, maps:get(url, Req)),
+    ?assertEqual({ok, enabled}, Result).
+
+put_bucket_versioning_test() ->
+    {Req, Result} = run(resp(200, [], <<>>), fun(C) ->
+        livery_s3:put_bucket_versioning(C, <<"b">>, enabled)
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<Status>Enabled</Status>">>) =/= nomatch),
+    ?assertEqual(ok, Result).
+
+put_bucket_versioning_suspended_test() ->
+    {Req, Result} = run(resp(200, [], <<>>), fun(C) ->
+        livery_s3:put_bucket_versioning(C, <<"b">>, suspended)
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<Status>Suspended</Status>">>) =/= nomatch),
+    ?assertEqual(ok, Result).
+
+%%====================================================================
+%% Multipart and batch delete
+%%====================================================================
+
+create_multipart_test() ->
+    Xml =
+        <<"<InitiateMultipartUploadResult><UploadId>UP1</UploadId></InitiateMultipartUploadResult>">>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:create_multipart_upload(C, <<"b">>, <<"k">>)
+    end),
+    ?assertEqual(post, maps:get(method, Req)),
+    ?assertEqual(<<"https://s3.example.com/b/k?uploads=">>, maps:get(url, Req)),
+    ?assertEqual({ok, <<"UP1">>}, Result).
+
+delete_objects_test() ->
+    Xml =
+        <<"<DeleteResult><Deleted><Key>a</Key></Deleted><Deleted><Key>b</Key></Deleted></DeleteResult>">>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:delete_objects(C, <<"bucket">>, [<<"a">>, <<"b">>])
+    end),
+    ?assertEqual(post, maps:get(method, Req)),
+    ?assertEqual(<<"https://s3.example.com/bucket?delete=">>, maps:get(url, Req)),
+    ?assertNotEqual(undefined, header(<<"content-md5">>, maps:get(headers, Req))),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<Key>a</Key>">>) =/= nomatch),
+    {ok, Map} = Result,
+    ?assertEqual([#{key => <<"a">>}, #{key => <<"b">>}], maps:get(deleted, Map)),
+    ?assertEqual([], maps:get(errors, Map)).
+
+%%====================================================================
+%% Presign (no network)
+%%====================================================================
+
+presign_test() ->
+    C = client(resp(200, [], <<>>)),
+    {ok, Url} = livery_s3:presign(C, get, <<"b">>, <<"k">>, 3600),
+    ?assert(binary:match(Url, <<"https://s3.example.com/b/k?">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"X-Amz-Signature=">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"X-Amz-Expires=3600">>) =/= nomatch).
+
+%%====================================================================
+%% Objects (additional coverage)
+%%====================================================================
+
+put_object_stream_body_test() ->
+    Producer = fun() -> eof end,
+    {Req, _} = run(resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, {stream, Producer})
+    end),
+    ?assertMatch({stream, _}, maps:get(body, Req)).
+
+get_object_streaming_test() ->
+    {Req, Result} = run(resp(200, [], <<"streamed-bytes">>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{stream => true})
+    end),
+    ?assertEqual(true, maps:get(stream, Req)),
+    {ok, #{body := {stream, Reader}}} = Result,
+    ?assertEqual({ok, <<"streamed-bytes">>}, livery_client:read_body(Reader)).
+
+get_object_versioned_test() ->
+    {Req, _} = run(resp(200, [], <<"v">>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{version_id => <<"V2">>})
+    end),
+    ?assertEqual(<<"https://s3.example.com/b/k?versionId=V2">>, maps:get(url, Req)).
+
+head_object_success_test() ->
+    Headers = [
+        {<<"Content-Length">>, <<"42">>},
+        {<<"Content-Type">>, <<"application/json">>},
+        {<<"ETag">>, <<"\"abc\"">>},
+        {<<"Last-Modified">>, <<"Mon, 01 Jan 2020 00:00:00 GMT">>},
+        {<<"x-amz-version-id">>, <<"v9">>},
+        {<<"x-amz-meta-k">>, <<"val">>}
+    ],
+    {Req, Result} = run(resp(200, Headers, <<>>), fun(C) ->
+        livery_s3:head_object(C, <<"b">>, <<"k">>)
+    end),
+    ?assertEqual(head, maps:get(method, Req)),
+    ?assertEqual(
+        {ok, #{
+            content_length => 42,
+            content_type => <<"application/json">>,
+            etag => <<"abc">>,
+            last_modified => <<"Mon, 01 Jan 2020 00:00:00 GMT">>,
+            version_id => <<"v9">>,
+            metadata => #{<<"k">> => <<"val">>}
+        }},
+        Result
+    ).
+
+delete_object_simple_test() ->
+    {Req, Result} = run(resp(204, [], <<>>), fun(C) ->
+        livery_s3:delete_object(C, <<"b">>, <<"k">>)
+    end),
+    ?assertEqual(<<"https://s3.example.com/b/k">>, maps:get(url, Req)),
+    ?assertEqual(ok, Result).
+
+copy_object_metadata_replace_test() ->
+    Xml = <<"<CopyObjectResult><ETag>\"c\"</ETag></CopyObjectResult>">>,
+    {Req, _} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:copy_object(C, <<"s">>, <<"a">>, <<"d">>, <<"b">>, #{
+            metadata => #{<<"x">> => <<"y">>}
+        })
+    end),
+    H = maps:get(headers, Req),
+    ?assertEqual(<<"REPLACE">>, header(<<"x-amz-metadata-directive">>, H)),
+    ?assertEqual(<<"y">>, header(<<"x-amz-meta-x">>, H)).
+
+%%====================================================================
+%% Buckets (additional coverage)
+%%====================================================================
+
+create_bucket_simple_test() ->
+    {Req, Result} = run(resp(200, [], <<>>), fun(C) ->
+        livery_s3:create_bucket(C, <<"b">>)
+    end),
+    ?assertEqual(put, maps:get(method, Req)),
+    ?assertEqual(<<"https://s3.example.com/b">>, maps:get(url, Req)),
+    ?assertEqual({full, <<>>}, maps:get(body, Req)),
+    ?assertEqual(ok, Result).
+
+create_bucket_location_constraint_test() ->
+    {Req, _} = run(resp(200, [], <<>>), fun(C) ->
+        livery_s3:create_bucket(C, <<"b">>, #{location_constraint => <<"eu-west-1">>})
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(
+        binary:match(Body, <<"<LocationConstraint>eu-west-1</LocationConstraint>">>) =/= nomatch
+    ).
+
+create_bucket_acl_test() ->
+    {Req, _} = run(resp(200, [], <<>>), fun(C) ->
+        livery_s3:create_bucket(C, <<"b">>, #{acl => <<"private">>})
+    end),
+    ?assertEqual(<<"private">>, header(<<"x-amz-acl">>, maps:get(headers, Req))).
+
+delete_bucket_test() ->
+    {Req, Result} = run(resp(204, [], <<>>), fun(C) ->
+        livery_s3:delete_bucket(C, <<"b">>)
+    end),
+    ?assertEqual(delete, maps:get(method, Req)),
+    ?assertEqual(ok, Result).
+
+head_bucket_not_found_test() ->
+    {_, Result} = run(resp(404, [], <<>>), fun(C) -> livery_s3:head_bucket(C, <<"b">>) end),
+    ?assertEqual({error, not_found}, Result).
+
+list_objects_truncated_test() ->
+    Xml = <<
+        "<ListBucketResult><IsTruncated>true</IsTruncated>"
+        "<NextContinuationToken>TOK</NextContinuationToken>"
+        "<Contents><Key>a</Key><Size>1</Size></Contents></ListBucketResult>"
+    >>,
+    {_, {ok, Map}} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:list_objects(C, <<"b">>)
+    end),
+    ?assertEqual(true, maps:get(is_truncated, Map)),
+    ?assertEqual(<<"TOK">>, maps:get(next_continuation_token, Map)).
+
+list_objects_all_paginates_test() ->
+    Page1 = resp(
+        200,
+        [],
+        <<
+            "<ListBucketResult><IsTruncated>true</IsTruncated>"
+            "<NextContinuationToken>T2</NextContinuationToken>"
+            "<Contents><Key>a</Key></Contents></ListBucketResult>"
+        >>
+    ),
+    Page2 = resp(
+        200,
+        [],
+        <<
+            "<ListBucketResult><IsTruncated>false</IsTruncated>"
+            "<Contents><Key>b</Key></Contents></ListBucketResult>"
+        >>
+    ),
+    {Reqs, Result} = run_seq([Page1, Page2], fun(C) ->
+        livery_s3:list_objects_all(C, <<"b">>)
+    end),
+    ?assertEqual(2, length(Reqs)),
+    [_, Req2] = Reqs,
+    ?assert(binary:match(maps:get(url, Req2), <<"continuation-token=T2">>) =/= nomatch),
+    {ok, #{objects := Objects}} = Result,
+    ?assertEqual([<<"a">>, <<"b">>], [maps:get(key, O) || O <- Objects]).
+
+%%====================================================================
+%% Versioning (additional coverage)
+%%====================================================================
+
+get_bucket_versioning_none_test() ->
+    {_, Result} = run(resp(200, [], <<"<VersioningConfiguration/>">>), fun(C) ->
+        livery_s3:get_bucket_versioning(C, <<"b">>)
+    end),
+    ?assertEqual({ok, none}, Result).
+
+get_bucket_versioning_suspended_test() ->
+    Xml = <<"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>">>,
+    {_, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:get_bucket_versioning(C, <<"b">>)
+    end),
+    ?assertEqual({ok, suspended}, Result).
+
+list_object_versions_test() ->
+    Xml = <<
+        "<ListVersionsResult><IsTruncated>false</IsTruncated>"
+        "<Version><Key>k</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest>"
+        "<Size>3</Size><ETag>\"e\"</ETag></Version>"
+        "<DeleteMarker><Key>k</Key><VersionId>v0</VersionId><IsLatest>false</IsLatest></DeleteMarker>"
+        "</ListVersionsResult>"
+    >>,
+    {Req, {ok, Map}} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:list_object_versions(C, <<"b">>, #{prefix => <<"k">>})
+    end),
+    ?assert(binary:match(maps:get(url, Req), <<"versions=">>) =/= nomatch),
+    [V] = maps:get(versions, Map),
+    ?assertEqual(<<"v1">>, maps:get(version_id, V)),
+    ?assertEqual(true, maps:get(is_latest, V)),
+    ?assertEqual(3, maps:get(size, V)),
+    [D] = maps:get(delete_markers, Map),
+    ?assertEqual(<<"v0">>, maps:get(version_id, D)).
+
+%%====================================================================
+%% Multipart (additional coverage)
+%%====================================================================
+
+upload_part_test() ->
+    {Req, Result} = run(resp(200, [{<<"ETag">>, <<"\"p1\"">>}], <<>>), fun(C) ->
+        livery_s3:upload_part(C, <<"b">>, <<"k">>, <<"UP1">>, 1, <<"data">>)
+    end),
+    ?assertEqual(put, maps:get(method, Req)),
+    ?assert(binary:match(maps:get(url, Req), <<"partNumber=1">>) =/= nomatch),
+    ?assert(binary:match(maps:get(url, Req), <<"uploadId=UP1">>) =/= nomatch),
+    ?assertEqual({ok, #{etag => <<"p1">>}}, Result).
+
+complete_multipart_success_test() ->
+    Xml = <<
+        "<CompleteMultipartUploadResult><ETag>\"final-1\"</ETag>"
+        "<Location>http://x/k</Location></CompleteMultipartUploadResult>"
+    >>,
+    {Req, Result} = run(resp(200, [{<<"x-amz-version-id">>, <<"vv">>}], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [
+            {1, <<"p1">>}, {2, <<"p2">>}
+        ])
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<PartNumber>1</PartNumber>">>) =/= nomatch),
+    ?assert(binary:match(Body, <<"<ETag>\"p1\"</ETag>">>) =/= nomatch),
+    ?assertEqual(
+        {ok, #{etag => <<"final-1">>, location => <<"http://x/k">>, version_id => <<"vv">>}}, Result
+    ).
+
+complete_multipart_inline_error_test() ->
+    Xml = <<"<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>">>,
+    {_, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}])
+    end),
+    ?assertMatch({error, {s3, <<"NoSuchUpload">>, _, _}}, Result).
+
+abort_multipart_test() ->
+    {Req, Result} = run(resp(204, [], <<>>), fun(C) ->
+        livery_s3:abort_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>)
+    end),
+    ?assertEqual(delete, maps:get(method, Req)),
+    ?assert(binary:match(maps:get(url, Req), <<"uploadId=UP1">>) =/= nomatch),
+    ?assertEqual(ok, Result).
+
+delete_objects_versioned_with_errors_test() ->
+    Xml = <<
+        "<DeleteResult>"
+        "<Deleted><Key>a</Key><VersionId>v1</VersionId></Deleted>"
+        "<Error><Key>b</Key><Code>AccessDenied</Code><Message>no</Message></Error>"
+        "</DeleteResult>"
+    >>,
+    {Req, {ok, Map}} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:delete_objects(C, <<"bk">>, [{<<"a">>, <<"v1">>}, <<"b">>])
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<VersionId>v1</VersionId>">>) =/= nomatch),
+    ?assertEqual([#{key => <<"a">>, version_id => <<"v1">>}], maps:get(deleted, Map)),
+    ?assertEqual(
+        [#{key => <<"b">>, code => <<"AccessDenied">>, message => <<"no">>}], maps:get(errors, Map)
+    ).
+
+%%====================================================================
+%% Errors, presign, session token (additional coverage)
+%%====================================================================
+
+error_decoding_non_xml_test() ->
+    {_, Result} = run(resp(500, [], <<"upstream boom">>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>)
+    end),
+    ?assertMatch({error, {s3, <<"500">>, <<"upstream boom">>, #{status := 500}}}, Result).
+
+error_decoding_empty_body_test() ->
+    {_, Result} = run(resp(503, [], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>)
+    end),
+    ?assertMatch({error, {s3, <<"503">>, <<>>, #{status := 503}}}, Result).
+
+presign_versioned_test() ->
+    C = client(resp(200, [], <<>>)),
+    {ok, Url} = livery_s3:presign(C, get, <<"b">>, <<"k">>, 3600, #{version_id => <<"V7">>}),
+    ?assert(binary:match(Url, <<"versionId=V7">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"X-Amz-Signature=">>) =/= nomatch).
+
+session_token_signs_header_test() ->
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        session_token => <<"TOKEN123">>,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{
+            test_pid => self(), response => resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>)
+        }
+    }),
+    _ = livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>),
+    Req =
+        receive
+            {s3_request, R} -> R
+        after 2000 -> error(no_request)
+        end,
+    H = maps:get(headers, Req),
+    ?assertEqual(<<"TOKEN123">>, header(<<"x-amz-security-token">>, H)),
+    %% security-token is an x-amz-* header, so it must be in the signed set.
+    Auth = header(<<"authorization">>, H),
+    ?assert(binary:match(Auth, <<"x-amz-security-token">>) =/= nomatch).
+
+network_error_passthrough_test() ->
+    {_, GetResult} = run({error, econnrefused}, fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>)
+    end),
+    ?assertEqual({error, econnrefused}, GetResult),
+    {_, PutResult} = run({error, timeout}, fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>)
+    end),
+    ?assertEqual({error, timeout}, PutResult).
+
+batch_delete_escapes_keys_test() ->
+    {Req, _} = run(resp(200, [], <<"<DeleteResult/>">>), fun(C) ->
+        livery_s3:delete_objects(C, <<"b">>, [<<"a&b<c>\"d'e">>])
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"a&amp;b&lt;c&gt;&quot;d&apos;e">>) =/= nomatch).
+
+complete_multipart_quoted_etag_test() ->
+    Xml = <<"<CompleteMultipartUploadResult><ETag>\"f\"</ETag></CompleteMultipartUploadResult>">>,
+    {Req, _} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"U">>, [{1, <<"\"already\"">>}])
+    end),
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<ETag>\"already\"</ETag>">>) =/= nomatch).
+
+put_object_open_quote_etag_test() ->
+    %% A malformed ETag header (open quote only) is returned verbatim.
+    {_, Result} = run(resp(200, [{<<"ETag">>, <<"\"abc">>}], <<>>), fun(C) ->
+        livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>)
+    end),
+    ?assertEqual({ok, #{etag => <<"\"abc">>}}, Result).
+
+presign_session_token_test() ->
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        session_token => <<"TKN">>,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{response => resp(200, [], <<>>)}
+    }),
+    {ok, Url} = livery_s3:presign(C, get, <<"b">>, <<"k">>, 900),
+    ?assert(binary:match(Url, <<"X-Amz-Security-Token=TKN">>) =/= nomatch).
+
+addressing_virtual_test() ->
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        addressing => virtual,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{test_pid => self(), response => resp(200, [], <<"v">>)}
+    }),
+    _ = livery_s3:get_object(C, <<"bucket">>, <<"key">>),
+    Req =
+        receive
+            {s3_request, R} -> R
+        after 2000 -> error(no_request)
+        end,
+    ?assertEqual(<<"https://bucket.s3.example.com/key">>, maps:get(url, Req)).
+
+%% Every operation must pass a transport error straight through as {error, _}.
+all_ops_network_error_test() ->
+    Ops = [
+        fun(C) -> livery_s3:get_object(C, <<"b">>, <<"k">>) end,
+        fun(C) -> livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>) end,
+        fun(C) -> livery_s3:head_object(C, <<"b">>, <<"k">>) end,
+        fun(C) -> livery_s3:delete_object(C, <<"b">>, <<"k">>) end,
+        fun(C) -> livery_s3:copy_object(C, <<"b">>, <<"a">>, <<"b">>, <<"c">>) end,
+        fun(C) -> livery_s3:list_buckets(C) end,
+        fun(C) -> livery_s3:create_bucket(C, <<"b">>) end,
+        fun(C) -> livery_s3:delete_bucket(C, <<"b">>) end,
+        fun(C) -> livery_s3:head_bucket(C, <<"b">>) end,
+        fun(C) -> livery_s3:list_objects(C, <<"b">>) end,
+        fun(C) -> livery_s3:list_objects_all(C, <<"b">>) end,
+        fun(C) -> livery_s3:get_bucket_versioning(C, <<"b">>) end,
+        fun(C) -> livery_s3:put_bucket_versioning(C, <<"b">>, enabled) end,
+        fun(C) -> livery_s3:list_object_versions(C, <<"b">>) end,
+        fun(C) -> livery_s3:create_multipart_upload(C, <<"b">>, <<"k">>) end,
+        fun(C) -> livery_s3:upload_part(C, <<"b">>, <<"k">>, <<"u">>, 1, <<"x">>) end,
+        fun(C) ->
+            livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>, [{1, <<"e">>}])
+        end,
+        fun(C) -> livery_s3:abort_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>) end,
+        fun(C) -> livery_s3:delete_objects(C, <<"b">>, [<<"k">>]) end
+    ],
+    lists:foreach(
+        fun(Op) ->
+            {_, Result} = run({error, boom}, Op),
+            ?assertEqual({error, boom}, Result)
+        end,
+        Ops
+    ).
+
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+client(Resp) ->
+    livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AKIDEXAMPLE">>,
+        secret_access_key => <<"SECRET">>,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{test_pid => self(), response => Resp}
+    }).
+
+run(Resp, Fun) ->
+    C = client(Resp),
+    Result = Fun(C),
+    receive
+        {s3_request, Req} -> {Req, Result}
+    after 2000 ->
+        error(no_request_captured)
+    end.
+
+%% For multi-request operations: responses are consumed in order and every
+%% captured request is returned.
+run_seq(Responses, Fun) ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AKIDEXAMPLE">>,
+        secret_access_key => <<"SECRET">>,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{test_pid => self(), responses => Responses, counter => Ref}
+    }),
+    Result = Fun(C),
+    {drain_requests(), Result}.
+
+drain_requests() ->
+    receive
+        {s3_request, Req} -> [Req | drain_requests()]
+    after 200 -> []
+    end.
+
+resp(Status, Headers, Body) ->
+    #{status => Status, headers => Headers, body => {full, Body}}.
+
+header(Name, Headers) ->
+    L = string:lowercase(Name),
+    case lists:search(fun({K, _}) -> string:lowercase(K) =:= L end, Headers) of
+        {value, {_, V}} -> V;
+        false -> undefined
+    end.
+
+range_header_for(Range) ->
+    {Req, _} = run(resp(206, [], <<>>), fun(C) ->
+        livery_s3:get_object(C, <<"b">>, <<"k">>, #{range => Range})
+    end),
+    header(<<"range">>, maps:get(headers, Req)).

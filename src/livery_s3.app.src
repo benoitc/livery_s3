@@ -1,0 +1,17 @@
+{application, livery_s3, [
+    {description, "An S3-compatible object storage client built on the livery client"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        xmerl,
+        hackney,
+        livery
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/benoitc/livery_s3"}]}
+]}.
