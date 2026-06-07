@@ -7,16 +7,26 @@ AWS Signature V4.
 
 ## Features
 
-- Object CRUD: `put_object`, `get_object`, `head_object`, `delete_object`
+- Object CRUD: `put_object`, `get_object`, `head_object`, `delete_object`,
+  server-side `copy_object`
 - User + system metadata (`x-amz-meta-*`, content-type, cache-control, …)
 - Byte ranges and streaming up/downloads
+- Conditional requests (`if_match`/`if_none_match`/`if_modified_since`),
+  `Content-MD5`, and GET/presign response-header overrides
 - Bucket management: `list_buckets`, `create_bucket`, `delete_bucket`,
-  `head_bucket`, `list_objects` (V2, with pagination via `list_objects_all`)
+  `head_bucket`, `get_bucket_location`, `list_objects` (V2, with pagination via
+  `list_objects_all`)
 - Versioning (where the backend supports it): `get_bucket_versioning`,
   `put_bucket_versioning`, `list_object_versions`, versioned get/delete
-- Multipart upload, server-side copy, batch delete
-- Presigned URLs (`presign`)
-- Path-style (default) and virtual-hosted addressing
+- Multipart upload (`create`/`upload_part`/`complete`/`abort`,
+  `upload_part_copy`, `list_parts`, `list_multipart_uploads`)
+- Batch delete and presigned URLs (`presign`)
+- Resilience via livery_client layers: retries (on by default), circuit breaker,
+  concurrency cap, multi-endpoint balancing
+- Path-style (default) and virtual-hosted addressing; AWS SigV4 signing with
+  session-token support
+
+See [docs/features.md](docs/features.md) for the full reference.
 
 ## Usage
 
