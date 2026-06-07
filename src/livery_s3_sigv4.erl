@@ -49,6 +49,8 @@ it is exercised against AWS's published S3 worked examples in the tests.
 call(#{method := M, url := Url, headers := Headers0, body := Body} = Req, Next, Cfg) ->
     {DateTime, Date} = now_timestamps(),
     PayloadHash = payload_hash(Body),
+    %% A redirect layer may override the signing region per request via meta.
+    Region = maps:get(region, maps:get(meta, Req, #{}), Cfg#s3_config.region),
     #{authority := Authority, path := Path, query := Query} = livery_s3_uri:url_parts(Url),
     Added0 = [
         {<<"host">>, Authority},
@@ -70,7 +72,7 @@ call(#{method := M, url := Url, headers := Headers0, body := Body} = Req, Next, 
         payload_hash => PayloadHash,
         access_key_id => Cfg#s3_config.access_key_id,
         secret => Cfg#s3_config.secret_access_key,
-        region => Cfg#s3_config.region,
+        region => Region,
         service => ?S3_SERVICE,
         datetime => DateTime,
         date => Date

@@ -797,6 +797,23 @@ retry_skips_non_idempotent_test() ->
     _ = livery_s3:create_multipart_upload(C, <<"b">>, <<"k">>),
     ?assertEqual(1, length(drain_requests())).
 
+retry_after_honored_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 2, backoff => {1, 1.0}, statuses => [503]}},
+        #{
+            test_pid => self(),
+            counter => Ref,
+            responses => [
+                resp(503, [{<<"retry-after">>, <<"0">>}], <<>>),
+                resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>)
+            ]
+        }
+    ),
+    Result = livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>),
+    ?assertEqual(2, length(drain_requests())),
+    ?assertMatch({ok, #{etag := <<"e">>}}, Result).
+
 retry_disabled_test() ->
     Ref = atomics:new(1, [{signed, false}]),
     C = client_with(
@@ -868,6 +885,182 @@ concurrency_test() ->
     ?assert(lists:member({error, overloaded}, Results)).
 
 %%====================================================================
+%% Region redirects
+%%====================================================================
+
+region_redirect_301_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    Redirect = resp(
+        301,
+        [{<<"x-amz-bucket-region">>, <<"us-west-2">>}],
+        <<
+            "<Error><Code>PermanentRedirect</Code>"
+            "<Endpoint>bucket.s3.us-west-2.amazonaws.com</Endpoint></Error>"
+        >>
+    ),
+    Ok = resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<"data">>),
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.us-east-1.amazonaws.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        addressing => virtual,
+        retry => false,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{test_pid => self(), counter => Ref, responses => [Redirect, Ok]}
+    }),
+    Result = livery_s3:get_object(C, <<"bucket">>, <<"key">>),
+    [R1, R2] = drain_requests(),
+    ?assertEqual(<<"https://bucket.s3.us-east-1.amazonaws.com/key">>, maps:get(url, R1)),
+    ?assertEqual(<<"https://bucket.s3.us-west-2.amazonaws.com/key">>, maps:get(url, R2)),
+    ?assertEqual(<<"us-west-2">>, maps:get(region, maps:get(meta, R2))),
+    ?assertEqual(
+        <<"bucket.s3.us-west-2.amazonaws.com">>, header(<<"host">>, maps:get(headers, R2))
+    ),
+    ?assertMatch({ok, #{body := <<"data">>}}, Result).
+
+region_redirect_400_resign_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    Bad = resp(
+        400,
+        [{<<"x-amz-bucket-region">>, <<"eu-west-1">>}],
+        <<"<Error><Code>AuthorizationHeaderMalformed</Code><Region>eu-west-1</Region></Error>">>
+    ),
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        retry => false,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{
+            test_pid => self(), counter => Ref, responses => [Bad, resp(200, [], <<"ok">>)]
+        }
+    }),
+    {ok, #{body := <<"ok">>}} = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    [R1, R2] = drain_requests(),
+    %% Same host, re-signed with the corrected region.
+    ?assertEqual(maps:get(url, R1), maps:get(url, R2)),
+    ?assertEqual(<<"eu-west-1">>, maps:get(region, maps:get(meta, R2))).
+
+region_redirect_disabled_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    Bad = resp(
+        400,
+        [],
+        <<"<Error><Code>AuthorizationHeaderMalformed</Code><Region>eu-west-1</Region></Error>">>
+    ),
+    C = livery_s3:new(#{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        retry => false,
+        follow_region_redirects => false,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{
+            test_pid => self(), counter => Ref, responses => [Bad, resp(200, [], <<"ok">>)]
+        }
+    }),
+    Result = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertMatch({error, {s3, <<"AuthorizationHeaderMalformed">>, _, _}}, Result).
+
+non_redirect_400_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => false},
+        #{
+            test_pid => self(),
+            counter => Ref,
+            responses => [
+                resp(
+                    400, [], <<"<Error><Code>InvalidArgument</Code><Message>bad</Message></Error>">>
+                )
+            ]
+        }
+    ),
+    Result = livery_s3:list_objects(C, <<"b">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertMatch({error, {s3, <<"InvalidArgument">>, _, _}}, Result).
+
+%% 301 with the corrected region only in the body (no x-amz-bucket-region header).
+region_redirect_body_region_test() ->
+    Redirect = resp(
+        301,
+        [],
+        <<
+            "<Error><Code>PermanentRedirect</Code>"
+            "<Endpoint>bucket.s3.eu-central-1.amazonaws.com</Endpoint>"
+            "<Region>eu-central-1</Region></Error>"
+        >>
+    ),
+    C = redirect_client([Redirect, resp(200, [], <<"ok">>)]),
+    {ok, #{body := <<"ok">>}} = livery_s3:get_object(C, <<"bucket">>, <<"key">>),
+    [_, R2] = drain_requests(),
+    ?assertEqual(<<"https://bucket.s3.eu-central-1.amazonaws.com/key">>, maps:get(url, R2)),
+    ?assertEqual(<<"eu-central-1">>, maps:get(region, maps:get(meta, R2))).
+
+%% 301 host move with no region echoed: host is swapped, region left as-is.
+region_redirect_no_region_test() ->
+    Redirect = resp(
+        301,
+        [],
+        <<
+            "<Error><Code>PermanentRedirect</Code>"
+            "<Endpoint>bucket.s3.eu-west-1.amazonaws.com</Endpoint></Error>"
+        >>
+    ),
+    C = redirect_client([Redirect, resp(200, [], <<"ok">>)]),
+    {ok, #{body := <<"ok">>}} = livery_s3:get_object(C, <<"bucket">>, <<"key">>),
+    [_, R2] = drain_requests(),
+    ?assertEqual(<<"https://bucket.s3.eu-west-1.amazonaws.com/key">>, maps:get(url, R2)),
+    ?assertEqual(error, maps:find(region, maps:get(meta, R2))).
+
+%% 301 without an <Endpoint> cannot be followed: returned to the caller.
+region_redirect_no_endpoint_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => false},
+        #{
+            test_pid => self(),
+            counter => Ref,
+            responses => [resp(301, [], <<"<Error><Code>PermanentRedirect</Code></Error>">>)]
+        }
+    ),
+    Result = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertMatch({error, {s3, <<"PermanentRedirect">>, _, _}}, Result).
+
+%% 400 AuthorizationHeaderMalformed without a region cannot be followed.
+region_redirect_400_no_region_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => false},
+        #{
+            test_pid => self(),
+            counter => Ref,
+            responses => [
+                resp(400, [], <<"<Error><Code>AuthorizationHeaderMalformed</Code></Error>">>)
+            ]
+        }
+    ),
+    Result = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertMatch({error, {s3, <<"AuthorizationHeaderMalformed">>, _, _}}, Result).
+
+%% An empty-bodied error is never mistaken for a redirect.
+region_redirect_empty_body_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => false},
+        #{test_pid => self(), counter => Ref, responses => [resp(400, [], <<>>)]}
+    ),
+    Result = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertMatch({error, {s3, <<"400">>, _, _}}, Result).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -914,6 +1107,20 @@ drain_requests() ->
         {s3_request, Req} -> [Req | drain_requests()]
     after 200 -> []
     end.
+
+%% Virtual-hosted client for region-redirect host-swap tests (retry off).
+redirect_client(Responses) ->
+    Ref = atomics:new(1, [{signed, false}]),
+    livery_s3:new(#{
+        endpoint => <<"https://s3.us-east-1.amazonaws.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        addressing => virtual,
+        retry => false,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{test_pid => self(), counter => Ref, responses => Responses}
+    }).
 
 %% Client with extra new/1 options merged over the base (for resilience tests).
 client_with(Extra, AdapterOpts) ->

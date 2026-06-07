@@ -38,8 +38,12 @@ Initial release.
 
 ### Resilience
 - Retries on by default (transient 5xx + connection errors, idempotent ops,
-  re-signed per attempt); opt-in circuit breaker, concurrency cap, and
-  multi-endpoint balancing, all via `livery_client` layers.
+  re-signed per attempt), honoring a `Retry-After` header; opt-in circuit
+  breaker, concurrency cap, and multi-endpoint balancing, all via `livery_client`
+  layers.
+- Region-redirect following (`301 PermanentRedirect` / `400
+  AuthorizationHeaderMalformed`): re-sign for the corrected region/host and retry
+  once (on by default, `follow_region_redirects => false` to disable).
 
 ### Transport and signing
 - AWS Signature V4 (validated against AWS's published S3 examples), path-style

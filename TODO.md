@@ -47,6 +47,7 @@ Remaining S3 features, by tier. Checked items are implemented; see
 - [x] Automatic retries/backoff on transient 5xx / connection errors (retry on by
       default; circuit breaker, concurrency cap, and multi-endpoint balancing via
       livery_client layers, opt-in)
-- [ ] Region-redirect handling (AWS `301` with the correct region)
+- [x] Region-redirect handling (AWS `301 PermanentRedirect` / `400
+      AuthorizationHeaderMalformed`; re-sign + retry once, on by default)
+- [x] Honor `Retry-After` on 503/429 (added to livery's retry layer upstream)
 - [ ] Anonymous / unsigned requests for public objects
-- [ ] Honor `Retry-After` on 503/429 (livery retry uses fixed backoff)

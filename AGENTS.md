@@ -79,10 +79,14 @@ addressing style in an `#s3_config{}`, and builds one `livery_client`
 whose stack is `[concurrency?, circuit_breaker?, retry, balance?,
 signing]` (outermost to innermost; see `build_stack/2`). The client
 value is reused for every call. **Retry is on by default** (transient
-5xx + connection errors, idempotent ops only; livery's retry layer
-never replays streamed bodies or non-idempotent methods).
-`circuit_breaker` and `endpoints`/`balance` are ETS-backed and need the
-`livery` application started; `retry` and `concurrency` do not.
+5xx + connection errors, idempotent ops only, honoring `Retry-After`;
+livery's retry layer never replays streamed bodies or non-idempotent
+methods). **Region-redirect following is on by default**
+(`livery_s3_redirect`): a `301`/`400 AuthorizationHeaderMalformed` is
+re-signed for the corrected region (via a per-request region override
+in `livery_s3_sigv4`) and retried once. `circuit_breaker` and
+`endpoints`/`balance` are ETS-backed and need the `livery` application
+started; `retry`, `concurrency`, and redirects do not.
 
 ### Request flow
 

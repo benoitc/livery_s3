@@ -108,8 +108,12 @@ Resilience (built on `livery_client` layers, outermost to innermost
 
 * `retry` - `true` (default), `false`, or an options map merged over the S3
   defaults `#{max => 3, backoff => {200, 2.0}, statuses => [429,500,502,503,504]}`.
-  Retries idempotent ops on transient statuses and connection errors; streamed
-  request bodies and non-idempotent methods are never replayed.
+  Retries idempotent ops on transient statuses and connection errors, honoring a
+  `Retry-After` header when present; streamed request bodies and non-idempotent
+  methods are never replayed.
+* `follow_region_redirects` - `true` (default) follows S3 region redirects
+  (`301 PermanentRedirect` / `400 AuthorizationHeaderMalformed`) by re-signing
+  for the corrected region/host and retrying once; `false` disables it.
 * `circuit_breaker` - `true`, `false` (default), or an options map (`name`
   defaults to the endpoint authority). Trips on connection-level failures.
 * `concurrency` - a positive integer cap on in-flight requests, or `false`
@@ -159,11 +163,19 @@ build_stack(Cfg, Opts) ->
                 lists:append([
                     concurrency_layer(Opts),
                     circuit_layer(Cfg, Opts),
+                    redirect_layer(Opts),
                     retry_layer(Opts),
                     balance_layer(Opts)
                 ])
         end,
     Layers ++ [{livery_s3_sigv4, Cfg}].
+
+-spec redirect_layer(map()) -> livery_client:stack().
+redirect_layer(Opts) ->
+    case maps:get(follow_region_redirects, Opts, true) of
+        false -> [];
+        true -> [{livery_s3_redirect, #{max => 1}}]
+    end.
 
 -spec retry_layer(map()) -> livery_client:stack().
 retry_layer(Opts) ->

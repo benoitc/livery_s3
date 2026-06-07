@@ -108,9 +108,16 @@ Built on `livery_client` layers, composed outermost to innermost as
 - `retry` (default **on**) - `true`, `false`, or an options map merged over the
   S3 defaults `#{max => 3, backoff => {200, 2.0}, statuses => [429,500,502,503,504]}`.
   Retries idempotent ops on those statuses and on connection errors, with
-  exponential backoff + jitter. Streamed request bodies and non-idempotent
-  methods (the `POST` ops: create/complete multipart, batch delete) are never
-  replayed. Each attempt is re-signed with a fresh `x-amz-date`.
+  exponential backoff + jitter, **honoring a `Retry-After` header** (delta-seconds,
+  capped by `retry_after_max`) when the server sends one. Streamed request bodies
+  and non-idempotent methods (the `POST` ops: create/complete multipart, batch
+  delete) are never replayed. Each attempt is re-signed with a fresh `x-amz-date`.
+- `follow_region_redirects` (default **on**) - follows AWS region redirects
+  (`301 PermanentRedirect` and `400 AuthorizationHeaderMalformed`) by re-signing
+  for the corrected region (and host, from the `<Endpoint>` / `x-amz-bucket-region`
+  signal) and retrying once. Single-region S3-compatible stores never emit these,
+  so it is a no-op there; set `false` to disable. Targets virtual-hosted
+  addressing for host moves.
 - `circuit_breaker` (default off) - `true`, `false`, or a map (`name`, `window`,
   `trip`, `cooldown`; `name` defaults to the endpoint authority). Opens on
   connection-level failures and then fails fast with `{error, circuit_open}`. It
