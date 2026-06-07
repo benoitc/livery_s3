@@ -10,6 +10,14 @@ SECRET_KEY=${LIVERY_S3_SECRET_KEY:-testsecretkey00000000000000000000000000000000
 BUCKET=${LIVERY_S3_BUCKET:-livery-s3-test}
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+# Pre-pull with retries: Docker Hub registry timeouts are a common CI flake.
+for attempt in 1 2 3 4 5; do
+  if docker pull "$IMAGE"; then break; fi
+  echo "image pull failed (attempt $attempt), retrying in 5s..."
+  sleep 5
+done
+
 docker run -d --name "$NAME" \
   -p 3900:3900 -p 3901:3901 -p 3903:3903 \
   -v "$HERE/garage.toml:/etc/garage.toml" \
