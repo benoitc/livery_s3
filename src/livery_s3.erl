@@ -96,10 +96,14 @@ Build a client. Options:
 
 * `endpoint` (required) - base URL, e.g. `<<"https://s3.eu-west-1.amazonaws.com">>`
   or `<<"http://127.0.0.1:3900">>`.
-* `access_key_id`, `secret_access_key` (required).
+* Credentials (one required): `access_key_id` + `secret_access_key`
+  (+ optional `session_token`) for static keys, or `credentials => Provider`
+  to source them from the environment, the shared config file, EC2/ECS instance
+  metadata, web-identity/STS, or the `default` chain. See `livery_s3_credentials`.
+  Refreshing providers (`imds`, `{web_identity, _}`) need the `livery_s3`
+  application started.
 * `region` - default `<<"us-east-1">>`.
 * `addressing` - `path` (default) or `virtual` (`bucket.host`).
-* `session_token` - for temporary credentials.
 * `timeout` - per-request timeout in ms (default 30000), applied by the
   transport (hackney `recv_timeout`).
 
@@ -138,9 +142,7 @@ new(Opts) ->
         host = Host,
         port = Port,
         region = maps:get(region, Opts, <<"us-east-1">>),
-        access_key_id = maps:get(access_key_id, Opts),
-        secret_access_key = maps:get(secret_access_key, Opts),
-        session_token = maps:get(session_token, Opts, undefined),
+        credentials = build_credentials(Opts),
         addressing = maps:get(addressing, Opts, path)
     },
     Http = livery_client:new(#{
@@ -150,6 +152,28 @@ new(Opts) ->
         stack => build_stack(Cfg, Opts)
     }),
     #s3_client{config = Cfg, http = Http, timeout = maps:get(timeout, Opts, 30000)}.
+
+%% Static `access_key_id`/`secret_access_key` are shorthand for a {static, ...}
+%% provider; otherwise `credentials` names a provider. One is required.
+-spec build_credentials(map()) -> livery_s3_credentials:handle().
+build_credentials(Opts) ->
+    Provider =
+        case maps:is_key(access_key_id, Opts) of
+            true ->
+                {static, maps:get(access_key_id, Opts), maps:get(secret_access_key, Opts),
+                    maps:get(session_token, Opts, undefined)};
+            false ->
+                maps:get(credentials, Opts, undefined)
+        end,
+    case Provider of
+        undefined ->
+            error(missing_credentials);
+        _ ->
+            case livery_s3_credentials:prepare(Provider) of
+                {ok, Handle} -> Handle;
+                {error, Reason} -> error({credentials, Reason})
+            end
+    end.
 
 %% Compose the layer stack outermost-first; signing is always innermost. A
 %% user-supplied `stack` bypasses the resilience builders.
@@ -223,7 +247,8 @@ balance_layer(Opts) ->
     end.
 
 -doc "Generate a presigned URL valid for `Expires` seconds. See `presign/6`.".
--spec presign(client(), atom() | binary(), bucket(), key(), pos_integer()) -> {ok, binary()}.
+-spec presign(client(), atom() | binary(), bucket(), key(), pos_integer()) ->
+    {ok, binary()} | {error, reason()}.
 presign(Client, Method, Bucket, Key, Expires) ->
     presign(Client, Method, Bucket, Key, Expires, #{}).
 
@@ -234,11 +259,19 @@ only the `host` header with an `UNSIGNED-PAYLOAD`, so it can be used directly by
 a browser or any HTTP client.
 """.
 -spec presign(client(), atom() | binary(), bucket(), key(), pos_integer(), map()) ->
-    {ok, binary()}.
+    {ok, binary()} | {error, reason()}.
 presign(#s3_client{config = Cfg}, Method, Bucket, Key, Expires, Opts) ->
-    {DateTime, Date} = livery_s3_sigv4:now_timestamps(),
-    Extra = version_query(Opts) ++ response_query(Opts),
-    {ok, livery_s3_sigv4:presigned_url(Cfg, Method, Bucket, Key, Expires, Extra, DateTime, Date)}.
+    case livery_s3_credentials:current(Cfg#s3_config.credentials) of
+        {ok, Creds} ->
+            Now = livery_s3_sigv4:now_timestamps(),
+            Extra = version_query(Opts) ++ response_query(Opts),
+            {ok,
+                livery_s3_sigv4:presigned_url(
+                    Cfg, Creds, Method, Bucket, Key, Expires, Extra, Now
+                )};
+        {error, Reason} ->
+            {error, {credentials, Reason}}
+    end.
 
 %%====================================================================
 %% Objects

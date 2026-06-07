@@ -45,6 +45,13 @@ Initial release.
   AuthorizationHeaderMalformed`): re-sign for the corrected region/host and retry
   once (on by default, `follow_region_redirects => false` to disable).
 
+### Credentials
+- Providers via `credentials => Provider`: `static`, `env`, `{file, Profile}`,
+  `imds` (EC2/ECS instance metadata), `{web_identity, _}` (STS
+  AssumeRoleWithWebIdentity), a `default` chain, and `fun`/`{M,F,A}`. Refreshing
+  providers cache and rotate temporary credentials
+  (`livery_s3_credentials_store`, started by the `livery_s3` application).
+
 ### Transport and signing
 - AWS Signature V4 (validated against AWS's published S3 examples), path-style
   (default) and virtual-hosted addressing, session tokens.

@@ -21,6 +21,11 @@ src/livery_s3_uri.erl    RFC 3986 encoding, canonical query, URL +
                          host building, endpoint parsing
 src/livery_s3_xml.erl    S3 XML responses -> light {Tag,Attrs,Children}
                          tree (xmerl_sax_parser) + navigation helpers
+src/livery_s3_redirect.erl       region-redirect follow layer
+src/livery_s3_credentials.erl    credential providers (static/env/file/
+                                 imds/web_identity/default/fun/mfa)
+src/livery_s3_credentials_store.erl  refresh cache (gen_server + ETS)
+src/livery_s3_app.erl / _sup.erl     start the credential cache
 include/livery_s3.hrl    Shared config record, SigV4 constants
 test/                    EUnit (SigV4 vectors, URI, XML, fake-adapter
                          round-trips) + livery_s3_garage_SUITE
@@ -87,6 +92,12 @@ re-signed for the corrected region (via a per-request region override
 in `livery_s3_sigv4`) and retried once. `circuit_breaker` and
 `endpoints`/`balance` are ETS-backed and need the `livery` application
 started; `retry`, `concurrency`, and redirects do not.
+
+Credentials come from a `livery_s3_credentials` provider (static keys are
+shorthand for `{static, ...}`). The signing layer resolves them per
+request, so refreshing providers (`imds`, `web_identity`) rotate
+temporary credentials; those are cached by `livery_s3_credentials_store`
+and need the `livery_s3` application started. env/file/static do not.
 
 ### Request flow
 

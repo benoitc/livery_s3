@@ -71,18 +71,17 @@ put_object_example_test() ->
 
 %% Example 3: presigned GET URL (query-string signing).
 presigned_url_example_test() ->
+    Creds = #{access_key_id => ?AK, secret_access_key => ?SK},
     Cfg = #s3_config{
         scheme = <<"https">>,
         host = <<"s3.amazonaws.com">>,
         port = undefined,
         region = ?REGION,
-        access_key_id = ?AK,
-        secret_access_key = ?SK,
-        session_token = undefined,
+        credentials = {fixed, Creds},
         addressing = virtual
     },
     Url = livery_s3_sigv4:presigned_url(
-        Cfg, get, <<"examplebucket">>, <<"test.txt">>, 86400, [], ?DATETIME, ?DATE
+        Cfg, Creds, get, <<"examplebucket">>, <<"test.txt">>, 86400, [], {?DATETIME, ?DATE}
     ),
     Expected = <<
         "https://examplebucket.s3.amazonaws.com/test.txt?"

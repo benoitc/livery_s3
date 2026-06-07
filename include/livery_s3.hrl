@@ -13,15 +13,15 @@
 ).
 
 %% Immutable per-client configuration. Captured once in livery_s3:new/1 and
-%% reused for URL building (endpoint + addressing) and request signing (keys +
-%% region). `port' is undefined when the endpoint URL carries no explicit port.
+%% reused for URL building (endpoint + addressing) and request signing
+%% (credentials handle + region). `port' is undefined when the endpoint URL
+%% carries no explicit port. `credentials' is a livery_s3_credentials handle
+%% resolved per request (static, or refreshing).
 -record(s3_config, {
     scheme :: binary(),
     host :: binary(),
     port :: undefined | inet:port_number(),
     region :: binary(),
-    access_key_id :: binary(),
-    secret_access_key :: binary(),
-    session_token :: undefined | binary(),
+    credentials :: livery_s3_credentials:handle(),
     addressing :: path | virtual
 }).

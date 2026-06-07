@@ -46,7 +46,20 @@ it is exercised against AWS's published S3 worked examples in the tests.
 -doc "Sign the request, then hand it to the next layer.".
 -spec call(livery_client:request(), livery_client:next(), #s3_config{}) ->
     livery_client:result().
-call(#{method := M, url := Url, headers := Headers0, body := Body} = Req, Next, Cfg) ->
+call(Req, Next, Cfg) ->
+    case livery_s3_credentials:current(Cfg#s3_config.credentials) of
+        {ok, Creds} -> sign_request(Req, Next, Cfg, Creds);
+        {error, Reason} -> {error, {credentials, Reason}}
+    end.
+
+-spec sign_request(
+    livery_client:request(),
+    livery_client:next(),
+    #s3_config{},
+    livery_s3_credentials:creds()
+) -> livery_client:result().
+sign_request(Req, Next, Cfg, Creds) ->
+    #{method := M, url := Url, headers := Headers0, body := Body} = Req,
     {DateTime, Date} = now_timestamps(),
     PayloadHash = payload_hash(Body),
     %% A redirect layer may override the signing region per request via meta.
@@ -58,7 +71,7 @@ call(#{method := M, url := Url, headers := Headers0, body := Body} = Req, Next, 
         {<<"x-amz-content-sha256">>, PayloadHash}
     ],
     Added =
-        case Cfg#s3_config.session_token of
+        case maps:get(session_token, Creds, undefined) of
             undefined -> Added0;
             Tok -> [{<<"x-amz-security-token">>, Tok} | Added0]
         end,
@@ -70,8 +83,8 @@ call(#{method := M, url := Url, headers := Headers0, body := Body} = Req, Next, 
         query => Query,
         headers => ToSign,
         payload_hash => PayloadHash,
-        access_key_id => Cfg#s3_config.access_key_id,
-        secret => Cfg#s3_config.secret_access_key,
+        access_key_id => maps:get(access_key_id, Creds),
+        secret => maps:get(secret_access_key, Creds),
         region => Region,
         service => ?S3_SERVICE,
         datetime => DateTime,
@@ -148,27 +161,28 @@ sign(#{
 %%====================================================================
 
 -doc """
-Build a presigned URL (query-string SigV4). `ExtraQuery` holds operation params
-(e.g. `versionId`); they are signed alongside the `X-Amz-*` auth params. Only
-the `host` header is signed and the payload is `UNSIGNED-PAYLOAD`.
+Build a presigned URL (query-string SigV4) with explicitly-resolved `Creds`.
+`ExtraQuery` holds operation params (e.g. `versionId`); they are signed alongside
+the `X-Amz-*` auth params. Only the `host` header is signed and the payload is
+`UNSIGNED-PAYLOAD`.
 """.
 -spec presigned_url(
     #s3_config{},
+    livery_s3_credentials:creds(),
     atom() | binary(),
     binary(),
     binary(),
     pos_integer(),
     [{binary(), binary()}],
-    binary(),
-    binary()
+    {binary(), binary()}
 ) -> binary().
-presigned_url(Cfg, Method, Bucket, Key, Expires, ExtraQuery, DateTime, Date) ->
+presigned_url(Cfg, Creds, Method, Bucket, Key, Expires, ExtraQuery, {DateTime, Date}) ->
     {Url0, Authority} = livery_s3_uri:request_target(Cfg, Bucket, Key, []),
     #{path := Path} = livery_s3_uri:url_parts(Url0),
     Scope = <<
         Date/binary, "/", (Cfg#s3_config.region)/binary, "/", ?S3_SERVICE/binary, "/aws4_request"
     >>,
-    Credential = <<(Cfg#s3_config.access_key_id)/binary, "/", Scope/binary>>,
+    Credential = <<(maps:get(access_key_id, Creds))/binary, "/", Scope/binary>>,
     AuthQuery0 = [
         {<<"X-Amz-Algorithm">>, ?SIGV4_ALGORITHM},
         {<<"X-Amz-Credential">>, Credential},
@@ -177,7 +191,7 @@ presigned_url(Cfg, Method, Bucket, Key, Expires, ExtraQuery, DateTime, Date) ->
         {<<"X-Amz-SignedHeaders">>, <<"host">>}
     ],
     AuthQuery =
-        case Cfg#s3_config.session_token of
+        case maps:get(session_token, Creds, undefined) of
             undefined -> AuthQuery0;
             Tok -> [{<<"X-Amz-Security-Token">>, Tok} | AuthQuery0]
         end,
@@ -188,7 +202,7 @@ presigned_url(Cfg, Method, Bucket, Key, Expires, ExtraQuery, DateTime, Date) ->
         query => CanonQuery,
         headers => [{<<"host">>, Authority}],
         payload_hash => ?UNSIGNED_PAYLOAD,
-        secret => Cfg#s3_config.secret_access_key,
+        secret => maps:get(secret_access_key, Creds),
         region => Cfg#s3_config.region,
         service => ?S3_SERVICE,
         datetime => DateTime,

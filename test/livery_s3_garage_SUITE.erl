@@ -29,7 +29,8 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     multipart_listing/1,
     upload_part_copy/1,
     presign_response_override/1,
-    resilience_stack/1
+    resilience_stack/1,
+    credential_env_provider/1
 ]).
 
 all() ->
@@ -50,7 +51,8 @@ all() ->
         multipart_listing,
         upload_part_copy,
         presign_response_override,
-        resilience_stack
+        resilience_stack,
+        credential_env_provider
     ].
 
 init_per_suite(Config) ->
@@ -273,6 +275,25 @@ resilience_stack(Config) ->
     {ok, _} = livery_s3:put_object(C, B, K, <<"resilient">>),
     {ok, #{body := <<"resilient">>}} = livery_s3:get_object(C, B, K),
     ok = livery_s3:delete_object(C, B, K).
+
+%% Credentials sourced from environment variables (env provider) sign and
+%% round-trip like static keys.
+credential_env_provider(Config) ->
+    Opts = ?config(opts, Config),
+    B = ?config(bucket, Config),
+    os:putenv("AWS_ACCESS_KEY_ID", binary_to_list(maps:get(access_key_id, Opts))),
+    os:putenv("AWS_SECRET_ACCESS_KEY", binary_to_list(maps:get(secret_access_key, Opts))),
+    try
+        Base = maps:without([access_key_id, secret_access_key], Opts),
+        C = livery_s3:new(Base#{credentials => env}),
+        K = uniq(<<"env-">>),
+        {ok, _} = livery_s3:put_object(C, B, K, <<"via-env">>),
+        {ok, #{body := <<"via-env">>}} = livery_s3:get_object(C, B, K),
+        ok = livery_s3:delete_object(C, B, K)
+    after
+        os:unsetenv("AWS_ACCESS_KEY_ID"),
+        os:unsetenv("AWS_SECRET_ACCESS_KEY")
+    end.
 
 %%====================================================================
 %% Helpers

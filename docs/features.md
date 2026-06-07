@@ -135,13 +135,35 @@ by default (the spawn-based `livery_client:timeout/1` would break streamed
 downloads); the `timeout` option bounds each receive via hackney `recv_timeout`,
 so total wall-clock grows with retries.
 
+## Credentials
+
+Pass static keys (`access_key_id` + `secret_access_key`, optional
+`session_token`) or a provider via `credentials => Provider`:
+
+- `env` - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`.
+- `{file, Profile}` - `~/.aws/credentials` (path via `AWS_SHARED_CREDENTIALS_FILE`,
+  profile via `AWS_PROFILE`).
+- `imds` - EC2/ECS instance metadata (IMDSv2), with refresh.
+- `{web_identity, Opts}` - STS `AssumeRoleWithWebIdentity` from
+  `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, with refresh.
+- `default` - the env -> web-identity -> file -> imds chain.
+- A `fun/0` or `{Module, Function, Args}` returning `{ok, creds()} | {error, _}`.
+
+Static/env/file are resolved once at `new/1`. Refreshing providers (`imds`,
+`web_identity`, custom funs that set `expires_at`) are cached and refreshed
+before expiry by `livery_s3_credentials_store`, so **they require the `livery_s3`
+application to be started** (`application:ensure_all_started(livery_s3)`). The
+resolved credentials feed SigV4 and work on any store; the providers are
+environment-specific (env/file/static everywhere, IMDS on AWS, web-identity on
+AWS or MinIO STS).
+
 ## Addressing and compatibility
 
 - `addressing => path` (default) keeps the bucket in the URL path; works with
   every S3-compatible store.
 - `addressing => virtual` uses `bucket.host`.
-- Requests are signed with AWS Signature V4. `session_token` is supported for
-  temporary credentials.
+- Requests are signed with AWS Signature V4; `session_token` and rotating
+  temporary credentials are supported.
 
 ## Not in scope (yet)
 

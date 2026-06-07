@@ -51,3 +51,7 @@ Remaining S3 features, by tier. Checked items are implemented; see
       AuthorizationHeaderMalformed`; re-sign + retry once, on by default)
 - [x] Honor `Retry-After` on 503/429 (added to livery's retry layer upstream)
 - [ ] Anonymous / unsigned requests for public objects
+- [x] Credential providers and refresh (static, env, file, IMDS, web-identity,
+      default chain; refreshing providers cached via the livery_s3 app)
+- [ ] SSO / credential_process / assume-role (non-web-identity) / ECS
+      relative-URI credential providers

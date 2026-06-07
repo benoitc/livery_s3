@@ -114,8 +114,6 @@ cfg(Addressing, Host, Port) ->
         host = Host,
         port = Port,
         region = <<"us-east-1">>,
-        access_key_id = <<"AK">>,
-        secret_access_key = <<"SK">>,
-        session_token = undefined,
+        credentials = {fixed, #{access_key_id => <<"AK">>, secret_access_key => <<"SK">>}},
         addressing = Addressing
     }.

@@ -23,6 +23,9 @@ AWS Signature V4.
 - Batch delete and presigned URLs (`presign`)
 - Resilience via livery_client layers: retries (on by default), circuit breaker,
   concurrency cap, multi-endpoint balancing
+- Credential providers: static, env, shared config file, EC2/ECS instance
+  metadata (IMDS), web-identity/STS, and a default chain, with refresh of
+  temporary credentials
 - Path-style (default) and virtual-hosted addressing; AWS SigV4 signing with
   session-token support
 
@@ -86,6 +89,21 @@ C = livery_s3:new(#{
 
 Streamed uploads and non-idempotent `POST` operations are never retried. See
 [docs/features.md](docs/features.md#resilience) for ordering and caveats.
+
+## Credentials
+
+Static keys, or a provider that sources them without a hardcoded secret:
+
+```erlang
+livery_s3:new(#{endpoint => E, region => R, credentials => env}).        %% AWS_* env vars
+livery_s3:new(#{endpoint => E, region => R, credentials => {file, <<"default">>}}).
+livery_s3:new(#{endpoint => E, region => R, credentials => imds}).       %% EC2/ECS role (refreshed)
+livery_s3:new(#{endpoint => E, region => R, credentials => default}).    %% env -> web-identity -> file -> imds
+```
+
+Refreshing providers (`imds`, `web_identity`) cache and rotate temporary
+credentials and need the `livery_s3` application started. See
+[docs/features.md](docs/features.md#credentials).
 
 ## Compatibility
 
