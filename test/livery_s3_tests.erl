@@ -735,15 +735,151 @@ upload_part_copy_test() ->
     ?assertEqual({ok, #{etag => <<"cp">>}}, R).
 
 %%====================================================================
+%% Resilience: retry, circuit breaker, concurrency
+%%====================================================================
+
+retry_then_success_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 3, backoff => {1, 1.0}, statuses => [503]}},
+        #{
+            test_pid => self(),
+            counter => Ref,
+            responses => [resp(503, [], <<>>), resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>)]
+        }
+    ),
+    Result = livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>),
+    Reqs = drain_requests(),
+    ?assertEqual(2, length(Reqs)),
+    ?assertMatch({ok, #{etag := <<"e">>}}, Result),
+    %% Each attempt is re-signed.
+    lists:foreach(
+        fun(R) -> ?assertNotEqual(undefined, header(<<"authorization">>, maps:get(headers, R))) end,
+        Reqs
+    ).
+
+retry_exhausts_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 3, backoff => {1, 1.0}, statuses => [503]}},
+        #{test_pid => self(), counter => Ref, responses => [resp(503, [], <<>>)]}
+    ),
+    Result = livery_s3:put_object(C, <<"b">>, <<"k">>, <<"x">>),
+    ?assertEqual(4, length(drain_requests())),
+    ?assertMatch({error, {s3, _, _, #{status := 503}}}, Result).
+
+retry_skips_non_retryable_status_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 3, backoff => {1, 1.0}}},
+        #{test_pid => self(), counter => Ref, responses => [resp(404, [], <<>>)]}
+    ),
+    Result = livery_s3:head_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertEqual({error, not_found}, Result).
+
+retry_skips_streamed_body_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 3, backoff => {1, 1.0}}},
+        #{test_pid => self(), counter => Ref, responses => [{error, closed}]}
+    ),
+    Result = livery_s3:put_object(C, <<"b">>, <<"k">>, {stream, fun() -> eof end}),
+    ?assertEqual(1, length(drain_requests())),
+    ?assertEqual({error, closed}, Result).
+
+retry_skips_non_idempotent_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => #{max => 3, backoff => {1, 1.0}, statuses => [503]}},
+        #{test_pid => self(), counter => Ref, responses => [resp(503, [], <<>>)]}
+    ),
+    _ = livery_s3:create_multipart_upload(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())).
+
+retry_disabled_test() ->
+    Ref = atomics:new(1, [{signed, false}]),
+    C = client_with(
+        #{retry => false},
+        #{test_pid => self(), counter => Ref, responses => [resp(503, [], <<>>)]}
+    ),
+    _ = livery_s3:get_object(C, <<"b">>, <<"k">>),
+    ?assertEqual(1, length(drain_requests())).
+
+circuit_breaker_test() ->
+    {ok, _} = application:ensure_all_started(livery),
+    Name = {cb, erlang:unique_integer([positive])},
+    C = client_with(
+        #{
+            retry => false,
+            circuit_breaker => #{name => Name, window => 3, trip => 0.5, cooldown => 60000}
+        },
+        #{response => {error, closed}}
+    ),
+    [
+        ?assertEqual({error, closed}, livery_s3:get_object(C, <<"b">>, <<"k">>))
+     || _ <- [1, 2, 3]
+    ],
+    ?assertEqual({error, circuit_open}, livery_s3:get_object(C, <<"b">>, <<"k">>)).
+
+stack_builders_test() ->
+    Base = #{
+        endpoint => <<"https://s3.example.com">>,
+        region => <<"us-east-1">>,
+        access_key_id => <<"AK">>,
+        secret_access_key => <<"SK">>,
+        adapter => livery_s3_fake_adapter,
+        adapter_opts => #{response => resp(200, [], <<>>)}
+    },
+    %% Every resilience option composes a usable stack (exercises build_stack/2).
+    Variants = [
+        Base,
+        Base#{retry => true},
+        Base#{circuit_breaker => true},
+        Base#{circuit_breaker => #{name => cb1}},
+        Base#{concurrency => 4},
+        Base#{endpoints => [<<"http://a">>, <<"http://b">>]},
+        Base#{balance => #{name => bal1, endpoints => [<<"http://a">>]}},
+        Base#{stack => [livery_client:retry(#{max => 1})]}
+    ],
+    lists:foreach(
+        fun(Opts) ->
+            C = livery_s3:new(Opts),
+            {ok, Url} = livery_s3:presign(C, get, <<"b">>, <<"k">>, 60),
+            ?assert(is_binary(Url))
+        end,
+        Variants
+    ).
+
+concurrency_test() ->
+    C = client_with(
+        #{retry => false, concurrency => 1},
+        #{response => resp(200, [], <<>>), delay => 200}
+    ),
+    Self = self(),
+    [spawn(fun() -> Self ! {r, livery_s3:get_object(C, <<"b">>, <<"k">>)} end) || _ <- [1, 2, 3]],
+    Results = [
+        receive
+            {r, R} -> R
+        after 5000 -> timeout
+        end
+     || _ <- [1, 2, 3]
+    ],
+    ?assert(lists:member({error, overloaded}, Results)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
+%% Deterministic single-attempt client: retry off so these tests assert exactly
+%% one request regardless of status. Resilience behavior is tested separately.
 client(Resp) ->
     livery_s3:new(#{
         endpoint => <<"https://s3.example.com">>,
         region => <<"us-east-1">>,
         access_key_id => <<"AKIDEXAMPLE">>,
         secret_access_key => <<"SECRET">>,
+        retry => false,
         adapter => livery_s3_fake_adapter,
         adapter_opts => #{test_pid => self(), response => Resp}
     }).
@@ -766,6 +902,7 @@ run_seq(Responses, Fun) ->
         region => <<"us-east-1">>,
         access_key_id => <<"AKIDEXAMPLE">>,
         secret_access_key => <<"SECRET">>,
+        retry => false,
         adapter => livery_s3_fake_adapter,
         adapter_opts => #{test_pid => self(), responses => Responses, counter => Ref}
     }),
@@ -777,6 +914,22 @@ drain_requests() ->
         {s3_request, Req} -> [Req | drain_requests()]
     after 200 -> []
     end.
+
+%% Client with extra new/1 options merged over the base (for resilience tests).
+client_with(Extra, AdapterOpts) ->
+    livery_s3:new(
+        maps:merge(
+            #{
+                endpoint => <<"https://s3.example.com">>,
+                region => <<"us-east-1">>,
+                access_key_id => <<"AK">>,
+                secret_access_key => <<"SK">>,
+                adapter => livery_s3_fake_adapter,
+                adapter_opts => AdapterOpts
+            },
+            Extra
+        )
+    ).
 
 resp(Status, Headers, Body) ->
     #{status => Status, headers => Headers, body => {full, Body}}.

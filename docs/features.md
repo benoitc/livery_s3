@@ -99,6 +99,35 @@ binaries or `{Key, VersionId}` tuples; the result is
 signed header). Works for any method; `Opts` may carry `version_id` and the
 `response_content_*` overrides.
 
+## Resilience
+
+Built on `livery_client` layers, composed outermost to innermost as
+`[concurrency, circuit_breaker, retry, balance, signing]`. Configure via
+`new/1`:
+
+- `retry` (default **on**) - `true`, `false`, or an options map merged over the
+  S3 defaults `#{max => 3, backoff => {200, 2.0}, statuses => [429,500,502,503,504]}`.
+  Retries idempotent ops on those statuses and on connection errors, with
+  exponential backoff + jitter. Streamed request bodies and non-idempotent
+  methods (the `POST` ops: create/complete multipart, batch delete) are never
+  replayed. Each attempt is re-signed with a fresh `x-amz-date`.
+- `circuit_breaker` (default off) - `true`, `false`, or a map (`name`, `window`,
+  `trip`, `cooldown`; `name` defaults to the endpoint authority). Opens on
+  connection-level failures and then fails fast with `{error, circuit_open}`. It
+  does not react to 5xx responses (that is retry's job).
+- `concurrency` (default off) - an integer cap on in-flight requests; over the
+  cap returns `{error, overloaded}`.
+- `endpoints` (default off) - a list of base URLs to spread/fail over across
+  gateways (path-style only, same region/credentials), or `balance => Map` for
+  full control. A retry above the balancer lands on a healthy endpoint.
+
+Caveats: `circuit_breaker` and `endpoints`/`balance` are ETS-backed and require
+the `livery` application to be started (`application:ensure_all_started(livery_s3)`);
+`retry` and `concurrency` need nothing. There is no overall hard-deadline layer
+by default (the spawn-based `livery_client:timeout/1` would break streamed
+downloads); the `timeout` option bounds each receive via hackney `recv_timeout`,
+so total wall-clock grows with retries.
+
 ## Addressing and compatibility
 
 - `addressing => path` (default) keeps the bucket in the URL path; works with

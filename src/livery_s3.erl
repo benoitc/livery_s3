@@ -73,6 +73,9 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
     not_found
     | not_modified
     | precondition_failed
+    | overloaded
+    | circuit_open
+    | timeout
     | {s3, binary(), binary(), map()}
     | term().
 -type bucket() :: binary().
@@ -80,6 +83,9 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 -type body() :: iodata() | {full, iodata()} | {stream, fun(() -> eof | {ok, binary(), fun()})}.
 
 -define(XML_DECL, <<"<?xml version=\"1.0\" encoding=\"UTF-8\"?>">>).
+%% S3-tuned retry defaults: transient server statuses + throttling, idempotent
+%% ops only (livery_client_retry never replays streamed bodies or POST).
+-define(DEFAULT_RETRY, #{max => 3, backoff => {200, 2.0}, statuses => [429, 500, 502, 503, 504]}).
 
 %%====================================================================
 %% Construction
@@ -96,11 +102,27 @@ Build a client. Options:
 * `session_token` - for temporary credentials.
 * `timeout` - per-request timeout in ms (default 30000), applied by the
   transport (hackney `recv_timeout`).
-* `stack` - extra `livery_client` layers (default none). They run outermost; the
-  signing layer is always appended innermost. Note the spawn-based
-  `livery_client:timeout/1` layer is incompatible with streamed downloads (it
-  tears down the connection when its worker exits) - rely on the `timeout`
-  option instead.
+
+Resilience (built on `livery_client` layers, outermost to innermost
+`[concurrency, circuit_breaker, retry, balance, signing]`):
+
+* `retry` - `true` (default), `false`, or an options map merged over the S3
+  defaults `#{max => 3, backoff => {200, 2.0}, statuses => [429,500,502,503,504]}`.
+  Retries idempotent ops on transient statuses and connection errors; streamed
+  request bodies and non-idempotent methods are never replayed.
+* `circuit_breaker` - `true`, `false` (default), or an options map (`name`
+  defaults to the endpoint authority). Trips on connection-level failures.
+* `concurrency` - a positive integer cap on in-flight requests, or `false`
+  (default); over the cap returns `{error, overloaded}`.
+* `endpoints` - a list of base URLs to spread/fail over (path-style only, same
+  region and credentials), or pass `balance => Map` for full control.
+
+`circuit_breaker` and `endpoints`/`balance` are ETS-backed and require the
+`livery` application to be started. `retry` and `concurrency` need nothing.
+
+* `stack` - a full `livery_client` layer stack that bypasses the builders above
+  (signing is still appended innermost). The spawn-based `livery_client:timeout/1`
+  layer is incompatible with streamed downloads, so it is never added by default.
 * `adapter`, `adapter_opts` - forwarded to `livery_client:new/1`.
 """.
 -spec new(map()) -> client().
@@ -117,14 +139,76 @@ new(Opts) ->
         session_token = maps:get(session_token, Opts, undefined),
         addressing = maps:get(addressing, Opts, path)
     },
-    Stack = maps:get(stack, Opts, []) ++ [{livery_s3_sigv4, Cfg}],
     Http = livery_client:new(#{
         base_url => <<>>,
         adapter => maps:get(adapter, Opts, livery_client_hackney),
         adapter_opts => maps:get(adapter_opts, Opts, #{}),
-        stack => Stack
+        stack => build_stack(Cfg, Opts)
     }),
     #s3_client{config = Cfg, http = Http, timeout = maps:get(timeout, Opts, 30000)}.
+
+%% Compose the layer stack outermost-first; signing is always innermost. A
+%% user-supplied `stack` bypasses the resilience builders.
+-spec build_stack(#s3_config{}, map()) -> livery_client:stack().
+build_stack(Cfg, Opts) ->
+    Layers =
+        case maps:find(stack, Opts) of
+            {ok, Custom} ->
+                Custom;
+            error ->
+                lists:append([
+                    concurrency_layer(Opts),
+                    circuit_layer(Cfg, Opts),
+                    retry_layer(Opts),
+                    balance_layer(Opts)
+                ])
+        end,
+    Layers ++ [{livery_s3_sigv4, Cfg}].
+
+-spec retry_layer(map()) -> livery_client:stack().
+retry_layer(Opts) ->
+    case maps:get(retry, Opts, true) of
+        false -> [];
+        true -> [livery_client:retry(?DEFAULT_RETRY)];
+        Map when is_map(Map) -> [livery_client:retry(maps:merge(?DEFAULT_RETRY, Map))]
+    end.
+
+-spec circuit_layer(#s3_config{}, map()) -> livery_client:stack().
+circuit_layer(Cfg, Opts) ->
+    case maps:get(circuit_breaker, Opts, false) of
+        false -> [];
+        true -> [livery_client:circuit_breaker(circuit_opts(Cfg, #{}))];
+        Map when is_map(Map) -> [livery_client:circuit_breaker(circuit_opts(Cfg, Map))]
+    end.
+
+-spec circuit_opts(#s3_config{}, map()) -> map().
+circuit_opts(Cfg, Map) ->
+    {_Url, Authority} = livery_s3_uri:request_target(Cfg, undefined, undefined, []),
+    maps:merge(#{name => Authority, window => 20, trip => 0.5, cooldown => 5000}, Map).
+
+-spec concurrency_layer(map()) -> livery_client:stack().
+concurrency_layer(Opts) ->
+    case maps:get(concurrency, Opts, false) of
+        false -> [];
+        N when is_integer(N), N > 0 -> [livery_client:concurrency(N)]
+    end.
+
+-spec balance_layer(map()) -> livery_client:stack().
+balance_layer(Opts) ->
+    case {maps:get(endpoints, Opts, undefined), maps:get(balance, Opts, undefined)} of
+        {undefined, undefined} ->
+            [];
+        {_, Map} when is_map(Map) ->
+            [livery_client:balance(Map)];
+        {Endpoints, undefined} when is_list(Endpoints) ->
+            [
+                livery_client:balance(#{
+                    name => {livery_s3_balance, Endpoints},
+                    endpoints => Endpoints,
+                    policy => p2c
+                })
+            ]
+    end.
 
 -doc "Generate a presigned URL valid for `Expires` seconds. See `presign/6`.".
 -spec presign(client(), atom() | binary(), bucket(), key(), pos_integer()) -> {ok, binary()}.

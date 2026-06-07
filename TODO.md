@@ -44,6 +44,9 @@ Remaining S3 features, by tier. Checked items are implemented; see
 
 - [ ] High-level "upload a large file/stream as multipart" helper
 - [ ] Presigned POST (browser form-upload policy)
-- [ ] Automatic retries/backoff on transient 5xx / connection errors
+- [x] Automatic retries/backoff on transient 5xx / connection errors (retry on by
+      default; circuit breaker, concurrency cap, and multi-endpoint balancing via
+      livery_client layers, opt-in)
 - [ ] Region-redirect handling (AWS `301` with the correct region)
 - [ ] Anonymous / unsigned requests for public objects
+- [ ] Honor `Retry-After` on 503/429 (livery retry uses fixed backoff)

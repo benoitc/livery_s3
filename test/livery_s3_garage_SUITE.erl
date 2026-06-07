@@ -28,7 +28,8 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     conditional_get/1,
     multipart_listing/1,
     upload_part_copy/1,
-    presign_response_override/1
+    presign_response_override/1,
+    resilience_stack/1
 ]).
 
 all() ->
@@ -48,22 +49,33 @@ all() ->
         conditional_get,
         multipart_listing,
         upload_part_copy,
-        presign_response_override
+        presign_response_override,
+        resilience_stack
     ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(hackney),
+    %% livery app provides the circuit/balance ETS stores.
+    {ok, _} = application:ensure_all_started(livery),
     Endpoint = env("LIVERY_S3_ENDPOINT", <<"http://127.0.0.1:3900">>),
-    Client = livery_s3:new(#{
+    Opts = #{
         endpoint => Endpoint,
         region => env("LIVERY_S3_REGION", <<"garage">>),
         access_key_id => env("LIVERY_S3_ACCESS_KEY", <<"GKtestaccesskey1234567890">>),
         secret_access_key =>
             env("LIVERY_S3_SECRET_KEY", <<"testsecretkey00000000000000000000000000000000000">>)
-    }),
+    },
+    Client = livery_s3:new(Opts),
     case wait_ready(Client, 30) of
-        ok -> [{client, Client}, {bucket, env("LIVERY_S3_BUCKET", <<"livery-s3-test">>)} | Config];
-        error -> {skip, "garage not reachable at " ++ binary_to_list(Endpoint)}
+        ok ->
+            [
+                {client, Client},
+                {opts, Opts},
+                {bucket, env("LIVERY_S3_BUCKET", <<"livery-s3-test">>)}
+                | Config
+            ];
+        error ->
+            {skip, "garage not reachable at " ++ binary_to_list(Endpoint)}
     end.
 
 end_per_suite(_Config) ->
@@ -249,6 +261,17 @@ presign_response_override(Config) ->
         response_content_type => <<"application/xml">>
     }),
     {ok, 200, _, <<"data">>} = hackney:request(get, Url, [], <<>>, [{with_body, true}]),
+    ok = livery_s3:delete_object(C, B, K).
+
+%% A client composed with retry (default), circuit breaker, and a concurrency
+%% cap still signs and round-trips correctly against a live endpoint.
+resilience_stack(Config) ->
+    Opts = ?config(opts, Config),
+    B = ?config(bucket, Config),
+    C = livery_s3:new(Opts#{circuit_breaker => true, concurrency => 20}),
+    K = uniq(<<"resil-">>),
+    {ok, _} = livery_s3:put_object(C, B, K, <<"resilient">>),
+    {ok, #{body := <<"resilient">>}} = livery_s3:get_object(C, B, K),
     ok = livery_s3:delete_object(C, B, K).
 
 %%====================================================================

@@ -18,6 +18,10 @@ request(Req, Opts) ->
         undefined -> ok;
         Pid -> Pid ! {s3_request, Req}
     end,
+    case maps:get(delay, Opts, 0) of
+        0 -> ok;
+        Ms -> timer:sleep(Ms)
+    end,
     case next_response(Opts) of
         {error, _} = Error -> Error;
         Resp -> {ok, maybe_stream(maps:get(stream, Req, false), Resp)}

@@ -57,6 +57,26 @@ Every call returns `{ok, _}` / `ok` or `{error, Reason}`. S3 error bodies surfac
 as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`; a missing
 object/bucket on a HEAD is `{error, not_found}`.
 
+## Resilience
+
+Retries are on by default (transient `5xx` + connection errors, idempotent ops,
+exponential backoff). Circuit breaking, a concurrency cap, and multi-endpoint
+balancing are opt-in:
+
+```erlang
+C = livery_s3:new(#{
+    endpoint => <<"https://s3.eu-west-1.amazonaws.com">>,
+    region   => <<"eu-west-1">>,
+    access_key_id => <<"AKIA...">>, secret_access_key => <<"...">>,
+    retry           => #{max => 5},   % or false to disable
+    circuit_breaker => true,          % needs the livery app started
+    concurrency     => 50
+}).
+```
+
+Streamed uploads and non-idempotent `POST` operations are never retried. See
+[docs/features.md](docs/features.md#resilience) for ordering and caveats.
+
 ## Compatibility
 
 `addressing => path` (the default) keeps the bucket in the URL path, which every

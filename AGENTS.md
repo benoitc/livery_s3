@@ -75,9 +75,14 @@ Override the target with `LIVERY_S3_ENDPOINT`, `LIVERY_S3_REGION`,
 ### Client construction
 
 `livery_s3:new/1` parses the endpoint, captures credentials and the
-addressing style in an `#s3_config{}`, and builds one
-`livery_client` with the SigV4 signing layer appended innermost. The
-client value is reused for every call.
+addressing style in an `#s3_config{}`, and builds one `livery_client`
+whose stack is `[concurrency?, circuit_breaker?, retry, balance?,
+signing]` (outermost to innermost; see `build_stack/2`). The client
+value is reused for every call. **Retry is on by default** (transient
+5xx + connection errors, idempotent ops only; livery's retry layer
+never replays streamed bodies or non-idempotent methods).
+`circuit_breaker` and `endpoints`/`balance` are ETS-backed and need the
+`livery` application started; `retry` and `concurrency` do not.
 
 ### Request flow
 
