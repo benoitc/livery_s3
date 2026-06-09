@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## 0.1.1 - 2026-06-09
+
+### Documentation
+- Usage examples for every function group in the features reference (object
+  CRUD, metadata, ranges/streaming, conditional writes, buckets, versioning,
+  multipart, batch delete, presigned URLs, resilience, credentials).
+
 ## 0.1.0 - 2026-06-08
 
 Initial release.
