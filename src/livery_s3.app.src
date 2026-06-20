@@ -1,6 +1,6 @@
 {application, livery_s3, [
     {description, "An S3-compatible object storage client built on the livery client"},
-    {vsn, "0.1.1"},
+    {vsn, "0.1.2"},
     {registered, [livery_s3_sup, livery_s3_credentials_store]},
     {mod, {livery_s3_app, []}},
     {applications, [
