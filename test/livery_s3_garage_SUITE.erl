@@ -26,6 +26,10 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     versioning/1,
     bucket_location/1,
     conditional_get/1,
+    multipart_complete_conditional_fresh/1,
+    multipart_complete_no_such_upload/1,
+    multipart_complete_if_none_match_existing/1,
+    multipart_complete_if_match_deleted/1,
     multipart_listing/1,
     upload_part_copy/1,
     presign_response_override/1,
@@ -48,6 +52,10 @@ all() ->
         versioning,
         bucket_location,
         conditional_get,
+        multipart_complete_conditional_fresh,
+        multipart_complete_no_such_upload,
+        multipart_complete_if_none_match_existing,
+        multipart_complete_if_match_deleted,
         multipart_listing,
         upload_part_copy,
         presign_response_override,
@@ -228,6 +236,109 @@ conditional_get(Config) ->
     ),
     {ok, #{body := <<"hello">>}} = livery_s3:get_object(C, B, K, #{if_match => Quoted}),
     ok = livery_s3:delete_object(C, B, K).
+
+%% A conditional completion over a key that does not exist: the precondition
+%% holds, so this must succeed on every store, whether or not it enforces
+%% conditional writes. Proves the header signs and round-trips.
+multipart_complete_conditional_fresh(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"mpu-cond-fresh-">>),
+    Part = binary:copy(<<"a">>, 100),
+    {ok, UploadId} = livery_s3:create_multipart_upload(C, B, K),
+    {ok, #{etag := ETag}} = livery_s3:upload_part(C, B, K, UploadId, 1, Part),
+    {ok, #{etag := _}} = livery_s3:complete_multipart_upload(C, B, K, UploadId, [{1, ETag}], #{
+        if_none_match => <<"*">>
+    }),
+    {ok, #{body := Got}} = livery_s3:get_object(C, B, K),
+    ?assertEqual(Part, Got),
+    ok = livery_s3:delete_object(C, B, K).
+
+%% A dead upload id is not the if_match-lost-to-delete race, so it must keep
+%% its S3 error code even though the request carries a conditional header.
+%% This needs no conditional-write support, so it is strict on every store.
+multipart_complete_no_such_upload(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"mpu-dead-">>),
+    {ok, UploadId} = livery_s3:create_multipart_upload(C, B, K),
+    {ok, #{etag := ETag}} = livery_s3:upload_part(C, B, K, UploadId, 1, binary:copy(<<"a">>, 100)),
+    ok = livery_s3:abort_multipart_upload(C, B, K, UploadId),
+    Result = livery_s3:complete_multipart_upload(C, B, K, UploadId, [{1, ETag}], #{
+        if_match => <<"\"deadbeef\"">>
+    }),
+    ct:pal("dead upload id + if_match -> ~p", [Result]),
+    ?assertNotEqual({error, not_found}, Result),
+    ?assertMatch({error, {s3, _, _, _}}, Result).
+
+%% A conditional completion over a key that already exists. Stores that enforce
+%% conditional writes must reject it and leave the object untouched; stores that
+%% ignore the header must complete and replace it. Both branches assert the
+%% resulting object state, so neither is a free pass.
+multipart_complete_if_none_match_existing(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"mpu-cond-exists-">>),
+    Original = <<"original">>,
+    New = binary:copy(<<"b">>, 100),
+    {ok, _} = livery_s3:put_object(C, B, K, Original),
+    {ok, UploadId} = livery_s3:create_multipart_upload(C, B, K),
+    {ok, #{etag := ETag}} = livery_s3:upload_part(C, B, K, UploadId, 1, New),
+    Result = livery_s3:complete_multipart_upload(C, B, K, UploadId, [{1, ETag}], #{
+        if_none_match => <<"*">>
+    }),
+    case Result of
+        {error, R} when R =:= precondition_failed; R =:= conditional_request_conflict ->
+            ct:pal("store ENFORCES conditional completion (~p)", [R]),
+            {ok, #{body := Original}} = livery_s3:get_object(C, B, K),
+            ok = livery_s3:abort_multipart_upload(C, B, K, UploadId);
+        {ok, #{etag := _}} ->
+            ct:pal("store IGNORES conditional completion: object was replaced"),
+            {ok, #{body := Got}} = livery_s3:get_object(C, B, K),
+            ?assertEqual(New, Got);
+        {error, {s3, Code, _, _}} ->
+            %% Store refuses conditional completion outright. The object must
+            %% still be untouched, and the upload must still be abortable.
+            ct:pal("store REJECTS conditional completion (~s)", [Code]),
+            {ok, #{body := Original}} = livery_s3:get_object(C, B, K),
+            ok = livery_s3:abort_multipart_upload(C, B, K, UploadId)
+    end,
+    ok = livery_s3:delete_object(C, B, K).
+
+%% The 404 race AWS documents for if_match, staged deterministically rather
+%% than raced: the object named by if_match is deleted before the completion
+%% lands. Stores split three ways here, and all three are legitimate:
+%%
+%%   * enforcing (AWS)  -> not_found: the object the condition named is gone.
+%%   * Garage           -> NoSuchUpload: deleting the key also discards the
+%%                         in-flight upload, so the upload id dies first.
+%%   * ignoring          -> the completion simply succeeds.
+%%
+%% The property that must hold everywhere is that a dead upload id keeps its S3
+%% code instead of being flattened into not_found, since the two need different
+%% recovery (re-upload the parts vs. the object really is absent).
+multipart_complete_if_match_deleted(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"mpu-cond-del-">>),
+    {ok, #{etag := Original}} = livery_s3:put_object(C, B, K, <<"original">>),
+    Quoted = <<"\"", Original/binary, "\"">>,
+    {ok, UploadId} = livery_s3:create_multipart_upload(C, B, K),
+    {ok, #{etag := ETag}} = livery_s3:upload_part(C, B, K, UploadId, 1, binary:copy(<<"c">>, 100)),
+    ok = livery_s3:delete_object(C, B, K),
+    Result = livery_s3:complete_multipart_upload(C, B, K, UploadId, [{1, ETag}], #{
+        if_match => Quoted
+    }),
+    ct:pal("if_match after concurrent delete -> ~p", [Result]),
+    case Result of
+        {error, Reason} when Reason =:= not_found; Reason =:= precondition_failed ->
+            ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K)),
+            _ = livery_s3:abort_multipart_upload(C, B, K, UploadId);
+        {error, {s3, <<"NoSuchUpload">>, _, _}} ->
+            %% The store discarded the upload along with the key. The object is
+            %% still gone, and the caller can tell "re-upload the parts" apart
+            %% from "the object is absent".
+            ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K));
+        {ok, #{etag := _}} ->
+            {ok, _} = livery_s3:head_object(C, B, K),
+            ok = livery_s3:delete_object(C, B, K)
+    end.
 
 multipart_listing(Config) ->
     {C, B} = ctx(Config),

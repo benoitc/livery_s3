@@ -420,6 +420,106 @@ complete_multipart_inline_error_test() ->
     end),
     ?assertMatch({error, {s3, <<"NoSuchUpload">>, _, _}}, Result).
 
+complete_multipart_conditional_headers_test() ->
+    Xml = <<"<CompleteMultipartUploadResult><ETag>\"f\"</ETag></CompleteMultipartUploadResult>">>,
+    {Req, Result} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_none_match => <<"*">>
+        })
+    end),
+    ?assertEqual(<<"*">>, header(<<"if-none-match">>, maps:get(headers, Req))),
+    %% The conditional header must not disturb the parts document.
+    {full, Body} = maps:get(body, Req),
+    ?assert(binary:match(Body, <<"<ETag>\"p1\"</ETag>">>) =/= nomatch),
+    ?assertEqual({ok, #{etag => <<"f">>, location => undefined}}, Result).
+
+complete_multipart_if_match_header_test() ->
+    Xml = <<"<CompleteMultipartUploadResult><ETag>\"f\"</ETag></CompleteMultipartUploadResult>">>,
+    {Req, _} = run(resp(200, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_match => <<"\"e\"">>
+        })
+    end),
+    ?assertEqual(<<"\"e\"">>, header(<<"if-match">>, maps:get(headers, Req))).
+
+complete_multipart_precondition_failed_test() ->
+    Xml = <<"<Error><Code>PreconditionFailed</Code><Message>no</Message></Error>">>,
+    {_, Result} = run(resp(412, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_none_match => <<"*">>
+        })
+    end),
+    ?assertEqual({error, precondition_failed}, Result).
+
+%% A concurrent write raced an if_none_match completion: the upload id is dead.
+complete_multipart_conflict_test() ->
+    Xml = <<"<Error><Code>ConditionalRequestConflict</Code><Message>raced</Message></Error>">>,
+    {_, Result} = run(resp(409, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_none_match => <<"*">>
+        })
+    end),
+    ?assertEqual({error, conditional_request_conflict}, Result).
+
+%% An if_match completion lost to a concurrent delete: the object is gone.
+complete_multipart_object_deleted_test() ->
+    Xml = <<"<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>">>,
+    {_, Result} = run(resp(404, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_match => <<"\"e\"">>
+        })
+    end),
+    ?assertEqual({error, not_found}, Result).
+
+%% A 404 naming a stale upload id is a different failure from the delete race
+%% and must keep its S3 code even on a conditional request.
+complete_multipart_no_such_upload_conditional_test() ->
+    Xml = <<"<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>">>,
+    {_, Result} = run(resp(404, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_match => <<"\"e\"">>
+        })
+    end),
+    ?assertMatch({error, {s3, <<"NoSuchUpload">>, _, #{status := 404}}}, Result).
+
+%% Gating: without a conditional opt the status mappings never apply, so /5
+%% keeps reporting NoSuchUpload/409 exactly as it did before /6 existed.
+complete_multipart_plain_404_unmapped_test() ->
+    Xml = <<"<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>">>,
+    {_, Result} = run(resp(404, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}])
+    end),
+    ?assertMatch({error, {s3, <<"NoSuchUpload">>, _, _}}, Result).
+
+complete_multipart_plain_409_unmapped_test() ->
+    Xml = <<"<Error><Code>OperationAborted</Code><Message>busy</Message></Error>">>,
+    {_, Result} = run(resp(409, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{})
+    end),
+    ?assertMatch({error, {s3, <<"OperationAborted">>, _, _}}, Result).
+
+%% An `undefined` conditional opt sends no header, so it must not switch the
+%% conditional mappings on either.
+complete_multipart_undefined_condition_test() ->
+    Xml = <<"<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>">>,
+    {Req, Result} = run(resp(404, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_match => undefined
+        })
+    end),
+    ?assertEqual(undefined, header(<<"if-match">>, maps:get(headers, Req))),
+    ?assertMatch({error, {s3, <<"NoSuchUpload">>, _, _}}, Result).
+
+%% An unrelated status on a conditional request still decodes as an S3 error.
+complete_multipart_conditional_other_status_test() ->
+    Xml = <<"<Error><Code>AccessDenied</Code><Message>no</Message></Error>">>,
+    {_, Result} = run(resp(403, [], Xml), fun(C) ->
+        livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>, [{1, <<"p1">>}], #{
+            if_none_match => <<"*">>
+        })
+    end),
+    ?assertMatch({error, {s3, <<"AccessDenied">>, _, _}}, Result).
+
 abort_multipart_test() ->
     {Req, Result} = run(resp(204, [], <<>>), fun(C) ->
         livery_s3:abort_multipart_upload(C, <<"b">>, <<"k">>, <<"UP1">>)
@@ -575,6 +675,11 @@ all_ops_network_error_test() ->
         fun(C) -> livery_s3:upload_part(C, <<"b">>, <<"k">>, <<"u">>, 1, <<"x">>) end,
         fun(C) ->
             livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>, [{1, <<"e">>}])
+        end,
+        fun(C) ->
+            livery_s3:complete_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>, [{1, <<"e">>}], #{
+                if_none_match => <<"*">>
+            })
         end,
         fun(C) -> livery_s3:abort_multipart_upload(C, <<"b">>, <<"k">>, <<"u">>) end,
         fun(C) -> livery_s3:delete_objects(C, <<"b">>, [<<"k">>]) end,

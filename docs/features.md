@@ -92,6 +92,9 @@ Emit = fun Loop([H | T]) -> {ok, H, fun() -> Loop(T) end};
 - `put_object/5` accepts `if_match` / `if_none_match` for conditional writes
   (e.g. `if_none_match => <<"*">>` for create-if-absent); enforcement is
   backend-dependent (AWS and MinIO enforce it, Garage currently does not).
+- `complete_multipart_upload/6` accepts the same `if_match` / `if_none_match`.
+  A multipart object is created at completion, not at
+  `create_multipart_upload/4`, so completion is where the guard belongs.
 - `put_object/5` with `content_md5 => true` adds a base64 `Content-MD5`
   integrity header (full-body uploads).
 
@@ -199,9 +202,21 @@ ok = livery_s3:delete_object(C, <<"photos">>, <<"cat.jpg">>, #{version_id => Vsn
 
 ## Multipart upload
 
-`create_multipart_upload/3,4`, `upload_part/6`, `complete_multipart_upload/5`,
-`abort_multipart_upload/4`. Pass the `{PartNumber, ETag}` pairs returned by
-`upload_part/6` to `complete_multipart_upload/5`.
+`create_multipart_upload/3,4`, `upload_part/6`,
+`complete_multipart_upload/5,6`, `abort_multipart_upload/4`. Pass the
+`{PartNumber, ETag}` pairs returned by `upload_part/6` to
+`complete_multipart_upload/5`.
+
+`complete_multipart_upload/6` takes an `Opts` map carrying `if_match` /
+`if_none_match` for a conditional write. Three outcomes are specific to a
+conditional completion:
+
+- `{error, precondition_failed}` - the precondition did not hold.
+- `{error, conditional_request_conflict}` - another operation raced an
+  `if_none_match` completion. The upload id is dead: start over from
+  `create_multipart_upload/4` and re-upload the parts.
+- `{error, not_found}` - an `if_match` completion lost to a concurrent delete.
+  A stale upload id still reports `{s3, <<"NoSuchUpload">>, _, _}` instead.
 
 Also: `upload_part_copy/7,8` (server-side copy a whole object or byte range as a
 part), `list_parts/4,5`, and `list_multipart_uploads/2,3`.
@@ -221,6 +236,15 @@ part), `list_parts/4,5`, and `list_multipart_uploads/2,3`.
 
 %% On failure, release the staged parts:
 %%   ok = livery_s3:abort_multipart_upload(C, <<"videos">>, <<"clip.mp4">>, UploadId).
+
+%% Publish only if nothing else claimed the key while the parts uploaded.
+case livery_s3:complete_multipart_upload(C, <<"videos">>, <<"clip.mp4">>, UploadId,
+                                         [{1, E1}, {2, E2}],
+                                         #{if_none_match => <<"*">>}) of
+    {ok, _}                              -> published;
+    {error, precondition_failed}         -> already_exists;
+    {error, conditional_request_conflict} -> restart_the_whole_upload
+end,
 
 %% Build a part from a byte range of an existing object (no download).
 {ok, #{etag := _E3}} =
