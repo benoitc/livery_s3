@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## 0.2.0 - 2026-08-01
+
+### Added
+- `complete_multipart_upload/6`: conditional writes on multipart completion via
+  `if_match` / `if_none_match`. A multipart object is created at completion, so
+  completion is where the guard applies. `complete_multipart_upload/5` is
+  unchanged.
+- `conditional_request_conflict` reason, for the `409` an `if_none_match`
+  completion gets when another operation races it. The upload id is dead and
+  the upload has to restart from `create_multipart_upload/4`.
+- MinIO as a second integration target (`test/docker/minio-up.sh`,
+  `make test-minio`), run alongside Garage in CI. Garage ignores conditional
+  writes, so it cannot exercise the enforcing paths.
+
+### Notes
+- The `412`/`409`/`404` mappings apply only when a conditional header was
+  actually sent. A `404` from a plain completion means `NoSuchUpload`, and that
+  keeps its S3 error rather than becoming `not_found`, since the two need
+  different recovery.
+
 ## 0.1.2 - 2026-06-20
 
 Maintenance release: dependency updates.
