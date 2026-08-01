@@ -128,12 +128,15 @@ jobs:
       - run: rebar3 eunit
 
   ct:
-    name: Common Test OTP ${{ matrix.otp }}
+    name: Common Test OTP ${{ matrix.otp }} (${{ matrix.store }})
     needs: [build]
     strategy:
       fail-fast: false
       matrix:
         otp: ['28', '29']
+        # Garage ignores conditional writes, MinIO enforces them: running the
+        # suite against both is what covers the If-Match/If-None-Match paths.
+        store: [garage, minio]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -149,9 +152,15 @@ jobs:
             _build
             ~/.cache/rebar3
           key: build-otp-${{ matrix.otp }}-${{ hashFiles('rebar.config') }}
-      - name: Start Garage
-        run: ./test/docker/garage-up.sh
-      - run: rebar3 ct --suite test/livery_s3_garage_SUITE
-      - name: Stop Garage
+      - name: Start ${{ matrix.store }}
+        run: ./test/docker/${{ matrix.store }}-up.sh
+      - name: Common Test
+        run: rebar3 ct --suite test/livery_s3_garage_SUITE
+        env:
+          LIVERY_S3_ENDPOINT: ${{ matrix.store == 'minio' && 'http://127.0.0.1:9000' || '' }}
+          LIVERY_S3_REGION: ${{ matrix.store == 'minio' && 'us-east-1' || '' }}
+          LIVERY_S3_ACCESS_KEY: ${{ matrix.store == 'minio' && 'minioadmin' || '' }}
+          LIVERY_S3_SECRET_KEY: ${{ matrix.store == 'minio' && 'minioadmin' || '' }}
+      - name: Stop ${{ matrix.store }}
         if: always()
-        run: ./test/docker/garage-down.sh
+        run: ./test/docker/${{ matrix.store }}-down.sh

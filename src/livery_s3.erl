@@ -54,7 +54,8 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 ]).
 %% Multipart.
 -export([create_multipart_upload/3, create_multipart_upload/4]).
--export([upload_part/6, complete_multipart_upload/5, abort_multipart_upload/4]).
+-export([upload_part/6, abort_multipart_upload/4]).
+-export([complete_multipart_upload/5, complete_multipart_upload/6]).
 -export([upload_part_copy/7, upload_part_copy/8]).
 -export([list_parts/4, list_parts/5, list_multipart_uploads/2, list_multipart_uploads/3]).
 %% Batch delete.
@@ -73,6 +74,7 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
     not_found
     | not_modified
     | precondition_failed
+    | conditional_request_conflict
     | overloaded
     | circuit_open
     | timeout
@@ -609,19 +611,83 @@ upload_part(Client, Bucket, Key, UploadId, PartNumber, Body) ->
 
 -doc """
 Complete a multipart upload. `Parts` is `[{PartNumber, ETag}]` in order (the
-ETags returned by `upload_part/6`).
+ETags returned by `upload_part/6`). See `complete_multipart_upload/6`.
 """.
 -spec complete_multipart_upload(client(), bucket(), key(), binary(), [{pos_integer(), binary()}]) ->
     {ok, map()} | {error, reason()}.
 complete_multipart_upload(Client, Bucket, Key, UploadId, Parts) ->
+    complete_multipart_upload(Client, Bucket, Key, UploadId, Parts, #{}).
+
+-doc """
+Complete a multipart upload with options. The object is created here, not by
+`create_multipart_upload/4`, so this is where a conditional write applies.
+`Opts` (backend-dependent, like `put_object/5`):
+
+* `if_none_match => <<"*">>` - complete only if the key does not already exist.
+* `if_match => ETag` - complete only if the current object matches `ETag`.
+
+Outcomes when a concurrent writer races the conditional completion:
+
+* `412` -> `{error, precondition_failed}`: the precondition did not hold (the
+  key already exists, or the `if_match` ETag no longer matches).
+* `409` -> `{error, conditional_request_conflict}`: another operation raced an
+  `if_none_match` completion. `UploadId` is dead; restart from
+  `create_multipart_upload/4`, re-uploading the parts.
+* `404` -> `{error, not_found}`: an `if_match` completion lost to a concurrent
+  delete. A `404` naming a stale upload id (`NoSuchUpload`) is a different
+  failure and still surfaces as an `{s3, Code, _, _}` error.
+
+Without `if_match`/`if_none_match` the response handling is unchanged: only a
+`2xx` carrying a `CompleteMultipartUploadResult` succeeds, everything else
+decodes to an S3 error.
+""".
+-spec complete_multipart_upload(
+    client(), bucket(), key(), binary(), [{pos_integer(), binary()}], map()
+) -> {ok, map()} | {error, reason()}.
+complete_multipart_upload(Client, Bucket, Key, UploadId, Parts, Opts) ->
     Body = build_complete_xml(Parts),
     Query = [{<<"uploadId">>, UploadId}],
-    case request(Client, post, Bucket, Key, Query, [], {full, Body}, #{}) of
+    Headers = conditional_headers(Opts),
+    case request(Client, post, Bucket, Key, Query, Headers, {full, Body}, #{}) of
         {ok, Resp} ->
-            on_result_xml(Resp, <<"CompleteMultipartUploadResult">>, fun complete_result/2);
+            complete_response(Resp, is_conditional_write(Opts));
         {error, _} = E ->
             E
     end.
+
+-spec complete_response(livery_client:response(), boolean()) -> {ok, map()} | {error, reason()}.
+complete_response(Resp, Conditional) ->
+    case livery_client:status(Resp) of
+        S when S >= 200, S < 300 ->
+            on_result_xml(Resp, <<"CompleteMultipartUploadResult">>, fun complete_result/2);
+        S when Conditional ->
+            complete_conflict(S, Resp);
+        _ ->
+            decode_error(Resp)
+    end.
+
+%% The races AWS documents for a conditional CompleteMultipartUpload. Only
+%% consulted when the request carried `if_match`/`if_none_match`, so a plain
+%% completion keeps reporting NoSuchUpload and friends as regular S3 errors.
+-spec complete_conflict(100..599, livery_client:response()) -> {error, reason()}.
+complete_conflict(412, _Resp) ->
+    {error, precondition_failed};
+complete_conflict(409, _Resp) ->
+    {error, conditional_request_conflict};
+complete_conflict(404, Resp) ->
+    case decode_error(Resp) of
+        {error, {s3, <<"NoSuchUpload">>, _, _}} = E -> E;
+        _ -> {error, not_found}
+    end;
+complete_conflict(_Status, Resp) ->
+    decode_error(Resp).
+
+%% Mirrors opt_header/3, which drops `undefined`: the mappings must key off the
+%% headers actually sent, not off the option being present.
+-spec is_conditional_write(map()) -> boolean().
+is_conditional_write(Opts) ->
+    maps:get(if_match, Opts, undefined) =/= undefined orelse
+        maps:get(if_none_match, Opts, undefined) =/= undefined.
 
 -doc "Abort a multipart upload and discard its parts.".
 -spec abort_multipart_upload(client(), bucket(), key(), binary()) -> ok | {error, reason()}.
