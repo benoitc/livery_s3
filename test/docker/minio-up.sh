@@ -10,14 +10,15 @@
 set -euo pipefail
 
 NAME=livery-s3-minio
-IMAGE=minio/minio:RELEASE.2025-04-22T22-12-26Z
+# quay.io: the minio/minio repository is no longer pullable from Docker Hub.
+IMAGE=quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
 ACCESS_KEY=${LIVERY_S3_ACCESS_KEY:-minioadmin}
 SECRET_KEY=${LIVERY_S3_SECRET_KEY:-minioadmin}
 BUCKET=${LIVERY_S3_BUCKET:-livery-s3-test}
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
-# Pre-pull with retries: Docker Hub registry timeouts are a common CI flake.
+# Pre-pull with retries: registry timeouts are a common CI flake.
 for attempt in 1 2 3 4 5; do
   if docker pull "$IMAGE"; then break; fi
   echo "image pull failed (attempt $attempt), retrying in 5s..."
