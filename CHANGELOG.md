@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## 0.2.1 - 2026-09-21
+
+Maintenance release: dependency updates.
+
+### Changed
+- Bump `livery` to `~> 0.10.2` (tracks 0.10.x) and `hackney` to `~> 4.7`
+  (tracks 4.x).
+
 ## 0.2.0 - 2026-08-01
 
 ### Added
