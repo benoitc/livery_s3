@@ -17,13 +17,18 @@ object keys with slashes map to literal path separators).
 
 -include("livery_s3.hrl").
 
--export([encode/1, encode_path/1]).
+-export([encode/1, encode_path/1, decode/1]).
 -export([canonical_query/1]).
 -export([parse_endpoint/1]).
 -export([request_target/4]).
 -export([url_parts/1]).
 
 -type config() :: #s3_config{}.
+
+-define(IS_HEX(C),
+    ((C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) orelse
+        (C >= $A andalso C =< $F))
+).
 -type query_params() :: [{binary(), binary()}].
 
 %%====================================================================
@@ -37,6 +42,29 @@ encode(Bin) -> encode(Bin, false).
 -doc "Like `encode/1` but keep `/` (for object keys used as path segments).".
 -spec encode_path(binary()) -> binary().
 encode_path(Bin) -> encode(Bin, true).
+
+-doc """
+Decode a value S3 returned under `encoding-type=url`: `%XX` escapes and `+` for
+a space (form encoding, as AWS and MinIO send it). A `%` not followed by two
+hex digits is kept as is.
+""".
+-spec decode(binary()) -> binary().
+decode(Bin) -> decode(Bin, <<>>).
+
+-spec decode(binary(), binary()) -> binary().
+decode(<<$%, H, L, Rest/binary>>, Acc) when ?IS_HEX(H), ?IS_HEX(L) ->
+    decode(Rest, <<Acc/binary, (unhex(H) * 16 + unhex(L))>>);
+decode(<<$+, Rest/binary>>, Acc) ->
+    decode(Rest, <<Acc/binary, $\s>>);
+decode(<<C, Rest/binary>>, Acc) ->
+    decode(Rest, <<Acc/binary, C>>);
+decode(<<>>, Acc) ->
+    Acc.
+
+-spec unhex(byte()) -> 0..15.
+unhex(C) when C >= $0, C =< $9 -> C - $0;
+unhex(C) when C >= $a, C =< $f -> C - $a + 10;
+unhex(C) when C >= $A, C =< $F -> C - $A + 10.
 
 -spec encode(binary(), boolean()) -> binary().
 encode(Bin, KeepSlash) ->

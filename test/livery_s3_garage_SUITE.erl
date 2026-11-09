@@ -49,7 +49,8 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     post_too_large_rejected/1,
     post_expired_rejected/1,
     tagging_roundtrip/1,
-    tagging_on_write/1
+    tagging_on_write/1,
+    list_encoding_url/1
 ]).
 
 all() ->
@@ -90,7 +91,8 @@ all() ->
         post_too_large_rejected,
         post_expired_rejected,
         tagging_roundtrip,
-        tagging_on_write
+        tagging_on_write,
+        list_encoding_url
     ].
 
 init_per_suite(Config) ->
@@ -726,6 +728,30 @@ tagging_on_write(Config) ->
         ok
     end.
 
+%%====================================================================
+%% encoding-type=url listings
+%%====================================================================
+
+%% Keys with a newline, a space, a plus, and non-ASCII come back intact.
+list_encoding_url(Config) ->
+    maybe
+        ok ?= require(encoding_url, Config),
+        {C, B} = ctx(Config),
+        Prefix = <<(uniq(<<"enc-">>))/binary, "/">>,
+        Names = [<<"line\nbreak">>, <<"sp ace+plus">>, <<"caf", 16#C3, 16#A9>>],
+        Keys = lists:sort([<<Prefix/binary, N/binary>> || N <- Names]),
+        [{ok, _} = livery_s3:put_object(C, B, K, <<"v">>) || K <- Keys],
+        {ok, #{objects := Objects}} =
+            livery_s3:list_objects(C, B, #{prefix => Prefix, encoding_type => url}),
+        ?assertEqual(Keys, lists:sort([maps:get(key, O) || O <- Objects])),
+        {ok, #{common_prefixes := Prefixes}} = livery_s3:list_objects(C, B, #{
+            prefix => Prefix, delimiter => <<" ">>, encoding_type => url
+        }),
+        ?assertEqual([<<Prefix/binary, "sp ">>], Prefixes),
+        [ok = livery_s3:delete_object(C, B, K) || K <- Keys],
+        ok
+    end.
+
 anon_client(Config) ->
     Opts = ?config(opts, Config),
     livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
@@ -754,9 +780,9 @@ backend() ->
 %% tagging is NotImplemented.
 %% MinIO: refuses SSE-C over plain HTTP, and the test container has no TLS.
 capabilities(garage) ->
-    [checksums, sse_c, post_object];
+    [checksums, sse_c, post_object, encoding_url];
 capabilities(minio) ->
-    [anonymous, checksums, sse_s3, sse_kms, post_object, tagging].
+    [anonymous, checksums, sse_s3, sse_kms, post_object, tagging, encoding_url].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->

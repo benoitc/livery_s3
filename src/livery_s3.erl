@@ -590,14 +590,18 @@ list_objects(Client, Bucket) ->
 
 -doc """
 List objects (ListObjectsV2). `Opts`: `prefix`, `delimiter`, `max_keys`,
-`continuation_token`, `start_after`. Result: `objects`, `common_prefixes`,
-`is_truncated`, `next_continuation_token`.
+`continuation_token`, `start_after`, `encoding_type`. Result: `objects`,
+`common_prefixes`, `is_truncated`, `next_continuation_token`.
+
+`encoding_type => url` has the store URL-encode the keys in its response and
+decodes them here. Use it when keys may hold characters XML cannot carry, such
+as control characters; the result holds the original keys either way.
 """.
 -spec list_objects(client(), bucket(), map()) -> {ok, map()} | {error, reason()}.
 list_objects(Client, Bucket, Opts) ->
     Query = [{<<"list-type">>, <<"2">>} | list_query(Opts)],
     case request(Client, get, Bucket, undefined, Query, [], empty, #{}) of
-        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_list_objects(R)} end);
+        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, decode_listing(parse_list_objects(R), Opts)} end);
         {error, _} = E -> E
     end.
 
@@ -671,14 +675,15 @@ list_object_versions(Client, Bucket) ->
 
 -doc """
 List object versions and delete markers. `Opts`: `prefix`, `delimiter`,
-`max_keys`, `key_marker`, `version_id_marker`. Result: `versions`,
-`delete_markers`, `is_truncated`, `next_key_marker`, `next_version_id_marker`.
+`max_keys`, `key_marker`, `version_id_marker`, `encoding_type` (as in
+`list_objects/3`). Result: `versions`, `delete_markers`, `is_truncated`,
+`next_key_marker`, `next_version_id_marker`.
 """.
 -spec list_object_versions(client(), bucket(), map()) -> {ok, map()} | {error, reason()}.
 list_object_versions(Client, Bucket, Opts) ->
     Query = [{<<"versions">>, <<>>} | versions_query(Opts)],
     case request(Client, get, Bucket, undefined, Query, [], empty, #{}) of
-        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_versions(R)} end);
+        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, decode_listing(parse_versions(R), Opts)} end);
         {error, _} = E -> E
     end.
 
@@ -887,7 +892,8 @@ list_multipart_uploads(Client, Bucket) ->
 
 -doc """
 List in-progress multipart uploads. `Opts`: `prefix`, `delimiter`, `max_uploads`,
-`key_marker`, `upload_id_marker`. Result: `uploads`
+`key_marker`, `upload_id_marker`, `encoding_type` (as in `list_objects/3`).
+Result: `uploads`
 (`#{key, upload_id, initiated}`), `common_prefixes`, `is_truncated`,
 `next_key_marker`, `next_upload_id_marker`.
 """.
@@ -895,8 +901,10 @@ List in-progress multipart uploads. `Opts`: `prefix`, `delimiter`, `max_uploads`
 list_multipart_uploads(Client, Bucket, Opts) ->
     Query = [{<<"uploads">>, <<>>} | uploads_query(Opts)],
     case request(Client, get, Bucket, undefined, Query, [], empty, #{}) of
-        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_multipart_uploads(R)} end);
-        {error, _} = E -> E
+        {ok, Resp} ->
+            on_2xx(Resp, fun(R) -> {ok, decode_listing(parse_multipart_uploads(R), Opts)} end);
+        {error, _} = E ->
+            E
     end.
 
 %%====================================================================
@@ -1395,7 +1403,8 @@ uploads_query(Opts) ->
         opt_query(<<"delimiter">>, delimiter, Opts),
         opt_query(<<"key-marker">>, key_marker, Opts),
         opt_query(<<"upload-id-marker">>, upload_id_marker, Opts),
-        int_query(<<"max-uploads">>, max_uploads, Opts)
+        int_query(<<"max-uploads">>, max_uploads, Opts),
+        encoding_query(Opts)
     ]).
 
 -spec parts_query(map()) -> [{binary(), binary()}].
@@ -1412,7 +1421,8 @@ list_query(Opts) ->
         opt_query(<<"delimiter">>, delimiter, Opts),
         opt_query(<<"start-after">>, start_after, Opts),
         opt_query(<<"continuation-token">>, continuation_token, Opts),
-        int_query(<<"max-keys">>, max_keys, Opts)
+        int_query(<<"max-keys">>, max_keys, Opts),
+        encoding_query(Opts)
     ]).
 
 -spec versions_query(map()) -> [{binary(), binary()}].
@@ -1422,8 +1432,44 @@ versions_query(Opts) ->
         opt_query(<<"delimiter">>, delimiter, Opts),
         opt_query(<<"key-marker">>, key_marker, Opts),
         opt_query(<<"version-id-marker">>, version_id_marker, Opts),
-        int_query(<<"max-keys">>, max_keys, Opts)
+        int_query(<<"max-keys">>, max_keys, Opts),
+        encoding_query(Opts)
     ]).
+
+-spec encoding_query(map()) -> [{binary(), binary()}].
+encoding_query(Opts) ->
+    case maps:get(encoding_type, Opts, undefined) of
+        undefined -> [];
+        url -> [{<<"encoding-type">>, <<"url">>}]
+    end.
+
+%% Under `encoding_type => url` the store returns keys URL-encoded; give the
+%% caller the original keys.
+-spec decode_listing(map(), map()) -> map().
+decode_listing(Result, #{encoding_type := url}) ->
+    Dec = fun livery_s3_uri:decode/1,
+    DecKey = fun(M) -> maps:update_with(key, fun(K) -> decode_opt(K) end, M) end,
+    maps:map(
+        fun
+            (List, Items) when
+                List =:= objects; List =:= versions; List =:= delete_markers; List =:= uploads
+            ->
+                [DecKey(I) || I <- Items];
+            (common_prefixes, Ps) ->
+                [Dec(P) || P <- Ps];
+            (next_key_marker, M) ->
+                decode_opt(M);
+            (_, V) ->
+                V
+        end,
+        Result
+    );
+decode_listing(Result, _Opts) ->
+    Result.
+
+-spec decode_opt(undefined | binary()) -> undefined | binary().
+decode_opt(undefined) -> undefined;
+decode_opt(B) -> livery_s3_uri:decode(B).
 
 -spec opt_query(binary(), atom(), map()) -> [{binary(), binary()}].
 opt_query(Name, Key, Opts) ->
