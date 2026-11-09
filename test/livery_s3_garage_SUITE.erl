@@ -36,7 +36,10 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     resilience_stack/1,
     credential_env_provider/1,
     anonymous_public_read/1,
-    anonymous_denied_on_private/1
+    anonymous_denied_on_private/1,
+    checksum_roundtrip/1,
+    checksum_mismatch_rejected/1,
+    checksum_multipart/1
 ]).
 
 all() ->
@@ -64,7 +67,10 @@ all() ->
         resilience_stack,
         credential_env_provider,
         anonymous_public_read,
-        anonymous_denied_on_private
+        anonymous_denied_on_private,
+        checksum_roundtrip,
+        checksum_mismatch_rejected,
+        checksum_multipart
     ].
 
 init_per_suite(Config) ->
@@ -446,6 +452,70 @@ anonymous_denied_on_private(Config) ->
     ?assertMatch({error, {s3, _, _, #{status := 403}}}, R),
     ok = livery_s3:delete_object(C, B, K).
 
+%%====================================================================
+%% Integrity checksums
+%%====================================================================
+
+%% Each algorithm: the store accepts the computed value and returns the same
+%% value on HEAD with checksum mode on.
+checksum_roundtrip(Config) ->
+    maybe
+        ok ?= require(checksums, Config),
+        {C, B} = ctx(Config),
+        Data = <<"checksummed payload">>,
+        lists:foreach(
+            fun(Alg) ->
+                K = uniq(<<"ck-", (atom_to_binary(Alg))/binary, "-">>),
+                Expected = livery_s3_checksum:compute(Alg, Data),
+                {ok, _} = livery_s3:put_object(C, B, K, Data, #{checksum => Alg}),
+                {ok, Meta} = livery_s3:head_object(C, B, K, #{checksum_mode => true}),
+                ct:pal("~p head checksum -> ~p", [Alg, maps:get(checksum, Meta, none)]),
+                ?assertEqual(Expected, maps:get(Alg, maps:get(checksum, Meta))),
+                ok = livery_s3:delete_object(C, B, K)
+            end,
+            [crc32, crc32c, sha1, sha256]
+        )
+    end.
+
+%% A wrong checksum is refused and nothing is stored.
+checksum_mismatch_rejected(Config) ->
+    maybe
+        ok ?= require(checksums, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"ck-bad-">>),
+        Wrong = livery_s3_checksum:compute(crc32, <<"something else">>),
+        Result = livery_s3:put_object(C, B, K, <<"payload">>, #{checksum => {crc32, Wrong}}),
+        ct:pal("mismatched checksum -> ~p", [Result]),
+        ?assertMatch({error, {s3, _, _, #{status := 400}}}, Result),
+        ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K))
+    end.
+
+%% A multipart upload with per-part CRC32C completes and reads back.
+checksum_multipart(Config) ->
+    maybe
+        ok ?= require(checksums, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"ck-mpu-">>),
+        P1 = binary:copy(<<"a">>, 5 * 1024 * 1024),
+        P2 = <<"tail">>,
+        {ok, U} = livery_s3:create_multipart_upload(C, B, K, #{checksum_algorithm => crc32c}),
+        {ok, #{etag := E1} = R1} = livery_s3:upload_part(C, B, K, U, 1, P1, #{checksum => crc32c}),
+        {ok, #{etag := E2} = R2} = livery_s3:upload_part(C, B, K, U, 2, P2, #{checksum => crc32c}),
+        ?assertEqual(
+            livery_s3_checksum:compute(crc32c, P1), maps:get(crc32c, maps:get(checksum, R1))
+        ),
+        Parts = [
+            {1, E1, #{crc32c => livery_s3_checksum:compute(crc32c, P1)}},
+            {2, E2, #{crc32c => livery_s3_checksum:compute(crc32c, P2)}}
+        ],
+        _ = R2,
+        {ok, Done} = livery_s3:complete_multipart_upload(C, B, K, U, Parts),
+        ct:pal("multipart completion -> ~p", [Done]),
+        {ok, #{body := Body}} = livery_s3:get_object(C, B, K),
+        ?assertEqual(<<P1/binary, P2/binary>>, Body),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
 anon_client(Config) ->
     Opts = ?config(opts, Config),
     livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
@@ -469,9 +539,9 @@ backend() ->
 %% Features each store implements. Every entry was checked against the real
 %% server; a testcase for a missing capability skips instead of passing silently.
 capabilities(garage) ->
-    [];
+    [checksums];
 capabilities(minio) ->
-    [anonymous].
+    [anonymous, checksums].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->

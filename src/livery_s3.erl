@@ -6,9 +6,11 @@ An S3-compatible object storage client built on the livery client.
 
 Build a client once with `new/1` (endpoint, region, credentials, addressing
 style), then call the operations: object CRUD with metadata and byte ranges,
-bucket management, versioning, multipart upload, copy, batch delete, and
-presigned URLs. Works against AWS S3 and S3-compatible stores (Garage, MinIO,
-Ceph, …); use `addressing => path` (the default) for the widest compatibility.
+integrity checksums, server-side encryption, object tagging, bucket management,
+versioning, multipart upload, copy, batch delete, presigned URLs, and presigned
+POST uploads. `credentials => anonymous` reads public buckets unsigned. Works
+against AWS S3 and S3-compatible stores (Garage, MinIO, Ceph, …); use
+`addressing => path` (the default) for the widest compatibility.
 
 ```erlang
 C = livery_s3:new(#{
@@ -54,14 +56,14 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 ]).
 %% Multipart.
 -export([create_multipart_upload/3, create_multipart_upload/4]).
--export([upload_part/6, abort_multipart_upload/4]).
+-export([upload_part/6, upload_part/7, abort_multipart_upload/4]).
 -export([complete_multipart_upload/5, complete_multipart_upload/6]).
 -export([upload_part_copy/7, upload_part_copy/8]).
 -export([list_parts/4, list_parts/5, list_multipart_uploads/2, list_multipart_uploads/3]).
 %% Batch delete.
 -export([delete_objects/3]).
 
--export_type([client/0, reason/0]).
+-export_type([client/0, reason/0, part/0]).
 
 -record(s3_client, {
     config :: #s3_config{},
@@ -83,6 +85,11 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 -type bucket() :: binary().
 -type key() :: binary().
 -type body() :: iodata() | {full, iodata()} | {stream, fun(() -> eof | {ok, binary(), fun()})}.
+%% A completed part: number and ETag, plus the checksums of the part when the
+%% upload was created with a checksum algorithm.
+-type part() ::
+    {pos_integer(), binary()}
+    | {pos_integer(), binary(), #{livery_s3_checksum:algorithm() => binary()}}.
 
 -define(XML_DECL, <<"<?xml version=\"1.0\" encoding=\"UTF-8\"?>">>).
 %% S3-tuned retry defaults: transient server statuses + throttling, idempotent
@@ -297,20 +304,27 @@ Conditional writes (backend-dependent): `if_none_match => <<"*">>` puts only if
 the object does not exist, `if_match => ETag` only if it matches; a failed
 precondition yields `{error, precondition_failed}`. `content_md5 => true` adds a
 base64 `Content-MD5` integrity header (full-body uploads only).
+
+Integrity checksums: `checksum => crc32 | crc32c | sha1 | sha256` computes the
+value over a full body and sends it as `x-amz-checksum-<alg>`; the store
+rejects the upload when it does not match. `checksum => {Alg, Base64}` sends a
+value you computed, the only form a `{stream, _}` body accepts. The result
+carries `checksum => #{Alg => Base64}` when the store echoes it.
 """.
 -spec put_object(client(), bucket(), key(), body(), map()) -> {ok, map()} | {error, reason()}.
 put_object(Client, Bucket, Key, Body, Opts) ->
     Body1 = to_body(Body),
-    Headers = object_write_headers(Opts) ++ conditional_headers(Opts) ++ md5_headers(Opts, Body1),
-    case request(Client, put, Bucket, Key, [], Headers, Body1, #{}) of
-        {ok, Resp} ->
-            case livery_client:status(Resp) of
-                S when S >= 200, S < 300 -> {ok, write_result(Resp)};
-                412 -> {error, precondition_failed};
-                _ -> decode_error(Resp)
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Extra} ?= livery_s3_checksum:headers(Opts, Body1),
+        Headers =
+            object_write_headers(Opts) ++ conditional_headers(Opts) ++
+                md5_headers(Opts, Body1) ++ Extra,
+        {ok, Resp} ?= request(Client, put, Bucket, Key, [], Headers, Body1, #{}),
+        case livery_client:status(Resp) of
+            S when S >= 200, S < 300 -> {ok, write_result(Resp)};
+            412 -> {error, precondition_failed};
+            _ -> decode_error(Resp)
+        end
     end.
 
 -doc "Download an object. See `get_object/4`.".
@@ -331,14 +345,15 @@ Download an object. `Opts`:
 * response-header overrides `response_content_type`, `response_content_disposition`,
   `response_cache_control`, `response_content_encoding`, `response_content_language`,
   `response_expires`.
+* `checksum_mode => true` - ask the store to return the object's checksum.
 
 The result map carries `body`, `metadata`, and (when present) `content_type`,
-`content_length`, `etag`, `last_modified`, `version_id`.
+`content_length`, `etag`, `last_modified`, `version_id`, `checksum`.
 """.
 -spec get_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 get_object(Client, Bucket, Key, Opts) ->
     Stream = maps:get(stream, Opts, false),
-    Headers = range_headers(Opts) ++ conditional_headers(Opts),
+    Headers = range_headers(Opts) ++ conditional_headers(Opts) ++ checksum_mode_header(Opts),
     Query = version_query(Opts) ++ response_query(Opts),
     case request(Client, get, Bucket, Key, Query, Headers, empty, #{stream => Stream}) of
         {ok, Resp} ->
@@ -358,14 +373,14 @@ head_object(Client, Bucket, Key) ->
     head_object(Client, Bucket, Key, #{}).
 
 -doc """
-Fetch object metadata. `Opts` may carry `version_id` and the same conditional
-headers as `get_object/4` (`304` -> `not_modified`, `412` ->
+Fetch object metadata. `Opts` may carry `version_id`, `checksum_mode`, and the
+same conditional headers as `get_object/4` (`304` -> `not_modified`, `412` ->
 `precondition_failed`).
 """.
 -spec head_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 head_object(Client, Bucket, Key, Opts) ->
     Query = version_query(Opts),
-    Headers = conditional_headers(Opts),
+    Headers = conditional_headers(Opts) ++ checksum_mode_header(Opts),
     case request(Client, head, Bucket, Key, Query, Headers, empty, #{}) of
         {ok, Resp} ->
             case livery_client:status(Resp) of
@@ -584,11 +599,16 @@ list_object_versions(Client, Bucket, Opts) ->
 create_multipart_upload(Client, Bucket, Key) ->
     create_multipart_upload(Client, Bucket, Key, #{}).
 
--doc "Begin a multipart upload. `Opts` accepts the `put_object/5` write options.".
+-doc """
+Begin a multipart upload. `Opts` accepts the `put_object/5` write options, plus
+`checksum_algorithm => crc32 | crc32c | sha1 | sha256` to have every part
+checksummed. With it, pass `checksum => Alg` to `upload_part/7` and the
+returned checksums to `complete_multipart_upload/5` as `{N, ETag, Checksums}`.
+""".
 -spec create_multipart_upload(client(), bucket(), key(), map()) ->
     {ok, binary()} | {error, reason()}.
 create_multipart_upload(Client, Bucket, Key, Opts) ->
-    Headers = object_write_headers(Opts),
+    Headers = object_write_headers(Opts) ++ livery_s3_checksum:algorithm_header(Opts),
     case request(Client, post, Bucket, Key, [{<<"uploads">>, <<>>}], Headers, empty, #{}) of
         {ok, Resp} ->
             on_2xx(Resp, fun(R) ->
@@ -599,25 +619,36 @@ create_multipart_upload(Client, Bucket, Key, Opts) ->
             E
     end.
 
--doc "Upload one part (1-based `PartNumber`). Returns `#{etag => _}`.".
+-doc "Upload one part (1-based `PartNumber`). See `upload_part/7`.".
 -spec upload_part(client(), bucket(), key(), binary(), pos_integer(), body()) ->
     {ok, map()} | {error, reason()}.
 upload_part(Client, Bucket, Key, UploadId, PartNumber, Body) ->
+    upload_part(Client, Bucket, Key, UploadId, PartNumber, Body, #{}).
+
+-doc """
+Upload one part (1-based `PartNumber`). `Opts` accepts `checksum` (as in
+`put_object/5`). Returns `#{etag => _}`, plus `checksum` when the store echoes
+one.
+""".
+-spec upload_part(client(), bucket(), key(), binary(), pos_integer(), body(), map()) ->
+    {ok, map()} | {error, reason()}.
+upload_part(Client, Bucket, Key, UploadId, PartNumber, Body, Opts) ->
+    Body1 = to_body(Body),
     Query = [{<<"partNumber">>, integer_to_binary(PartNumber)}, {<<"uploadId">>, UploadId}],
-    case request(Client, put, Bucket, Key, Query, [], to_body(Body), #{}) of
-        {ok, Resp} ->
-            on_2xx(Resp, fun(R) ->
-                {ok, #{etag => unquote(livery_client:header(<<"etag">>, R, <<>>))}}
-            end);
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Headers} ?= livery_s3_checksum:headers(Opts, Body1),
+        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Headers, Body1, #{}),
+        on_2xx(Resp, fun(R) ->
+            {ok, add_checksum(#{etag => unquote(livery_client:header(<<"etag">>, R, <<>>))}, R)}
+        end)
     end.
 
 -doc """
 Complete a multipart upload. `Parts` is `[{PartNumber, ETag}]` in order (the
-ETags returned by `upload_part/6`). See `complete_multipart_upload/6`.
+ETags returned by `upload_part/6`), or `[{PartNumber, ETag, Checksums}]` for an
+upload created with `checksum_algorithm`. See `complete_multipart_upload/6`.
 """.
--spec complete_multipart_upload(client(), bucket(), key(), binary(), [{pos_integer(), binary()}]) ->
+-spec complete_multipart_upload(client(), bucket(), key(), binary(), [part()]) ->
     {ok, map()} | {error, reason()}.
 complete_multipart_upload(Client, Bucket, Key, UploadId, Parts) ->
     complete_multipart_upload(Client, Bucket, Key, UploadId, Parts, #{}).
@@ -646,7 +677,7 @@ Without `if_match`/`if_none_match` the response handling is unchanged: only a
 decodes to an S3 error.
 """.
 -spec complete_multipart_upload(
-    client(), bucket(), key(), binary(), [{pos_integer(), binary()}], map()
+    client(), bucket(), key(), binary(), [part()], map()
 ) -> {ok, map()} | {error, reason()}.
 complete_multipart_upload(Client, Bucket, Key, UploadId, Parts, Opts) ->
     Body = build_complete_xml(Parts),
@@ -875,7 +906,7 @@ parse_body(Resp) ->
 
 -spec write_result(livery_client:response()) -> map().
 write_result(Resp) ->
-    add_version(#{etag => unquote(livery_client:header(<<"etag">>, Resp, <<>>))}, Resp).
+    add_response_fields(#{etag => unquote(livery_client:header(<<"etag">>, Resp, <<>>))}, Resp).
 
 -spec read_result(livery_client:response(), boolean()) -> map().
 read_result(Resp, true) ->
@@ -911,7 +942,19 @@ object_meta(Resp) ->
             undefined -> M2;
             ETag -> M2#{etag => unquote(ETag)}
         end,
-    add_version(M3, Resp).
+    add_response_fields(M3, Resp).
+
+%% Fields every object-level result may carry, read from response headers.
+-spec add_response_fields(map(), livery_client:response()) -> map().
+add_response_fields(Map, Resp) ->
+    add_checksum(add_version(Map, Resp), Resp).
+
+-spec add_checksum(map(), livery_client:response()) -> map().
+add_checksum(Map, Resp) ->
+    case livery_s3_checksum:from_headers(livery_client:headers(Resp)) of
+        Empty when map_size(Empty) =:= 0 -> Map;
+        Sums -> Map#{checksum => Sums}
+    end.
 
 -spec add_version(map(), livery_client:response()) -> map().
 add_version(Map, Resp) ->
@@ -1034,7 +1077,9 @@ add_marker(Map, Node) ->
 
 -spec copy_result(livery_s3_xml:tree(), livery_client:response()) -> map().
 copy_result(Tree, Resp) ->
-    add_version(#{etag => unquote(default(livery_s3_xml:text(Tree, <<"ETag">>), <<>>))}, Resp).
+    add_response_fields(
+        #{etag => unquote(default(livery_s3_xml:text(Tree, <<"ETag">>), <<>>))}, Resp
+    ).
 
 -spec complete_result(livery_s3_xml:tree(), livery_client:response()) -> map().
 complete_result(Tree, Resp) ->
@@ -1042,7 +1087,26 @@ complete_result(Tree, Resp) ->
         etag => unquote(default(livery_s3_xml:text(Tree, <<"ETag">>), <<>>)),
         location => livery_s3_xml:text(Tree, <<"Location">>)
     },
-    add_version(Base, Resp).
+    add_body_checksum(add_response_fields(Base, Resp), Tree).
+
+%% CompleteMultipartUpload returns the composite checksum in the XML body.
+-spec add_body_checksum(map(), livery_s3_xml:tree()) -> map().
+add_body_checksum(Map, Tree) ->
+    Found = [
+        {Alg, V}
+     || {Alg, El} <- [
+            {crc32, <<"ChecksumCRC32">>},
+            {crc32c, <<"ChecksumCRC32C">>},
+            {sha1, <<"ChecksumSHA1">>},
+            {sha256, <<"ChecksumSHA256">>}
+        ],
+        V <- [livery_s3_xml:text(Tree, El)],
+        V =/= undefined
+    ],
+    case Found of
+        [] -> Map;
+        _ -> Map#{checksum => maps:merge(maps:get(checksum, Map, #{}), maps:from_list(Found))}
+    end.
 
 -spec copy_part_result(livery_s3_xml:tree(), livery_client:response()) -> map().
 copy_part_result(Tree, _Resp) ->
@@ -1118,6 +1182,13 @@ object_write_headers(Opts) ->
         opt_header(<<"x-amz-acl">>, acl, Opts),
         meta_headers(Opts)
     ]).
+
+-spec checksum_mode_header(map()) -> [{binary(), binary()}].
+checksum_mode_header(Opts) ->
+    case maps:get(checksum_mode, Opts, false) of
+        true -> [{<<"x-amz-checksum-mode">>, <<"ENABLED">>}];
+        false -> []
+    end.
 
 -spec opt_header(binary(), atom(), map()) -> [{binary(), binary()}].
 opt_header(Name, Key, Opts) ->
@@ -1270,19 +1341,23 @@ delete_object_xml({Key, VersionId}) ->
 delete_object_xml(Key) when is_binary(Key) ->
     <<"<Object><Key>", (xml_escape(Key))/binary, "</Key></Object>">>.
 
--spec build_complete_xml([{pos_integer(), binary()}]) -> binary().
+-spec build_complete_xml([part()]) -> binary().
 build_complete_xml(Parts) ->
     Items = <<<<(part_xml(P))/binary>> || P <- Parts>>,
     <<?XML_DECL/binary, "<CompleteMultipartUpload>", Items/binary, "</CompleteMultipartUpload>">>.
 
--spec part_xml({pos_integer(), binary()}) -> binary().
+-spec part_xml(part()) -> binary().
 part_xml({Num, ETag}) ->
+    part_xml({Num, ETag, #{}});
+part_xml({Num, ETag, Checksums}) ->
     <<
         "<Part><PartNumber>",
         (integer_to_binary(Num))/binary,
         "</PartNumber><ETag>",
         (ensure_quoted(ETag))/binary,
-        "</ETag></Part>"
+        "</ETag>",
+        (livery_s3_checksum:part_xml(Checksums))/binary,
+        "</Part>"
     >>.
 
 %%====================================================================
