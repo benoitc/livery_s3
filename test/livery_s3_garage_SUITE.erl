@@ -43,7 +43,11 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     sse_c_roundtrip/1,
     sse_c_copy/1,
     sse_s3_roundtrip/1,
-    sse_kms_roundtrip/1
+    sse_kms_roundtrip/1,
+    post_upload/1,
+    post_upload_filename/1,
+    post_too_large_rejected/1,
+    post_expired_rejected/1
 ]).
 
 all() ->
@@ -78,7 +82,11 @@ all() ->
         sse_c_roundtrip,
         sse_c_copy,
         sse_s3_roundtrip,
-        sse_kms_roundtrip
+        sse_kms_roundtrip,
+        post_upload,
+        post_upload_filename,
+        post_too_large_rejected,
+        post_expired_rejected
     ].
 
 init_per_suite(Config) ->
@@ -592,6 +600,88 @@ sse_kms_roundtrip(Config) ->
         ok = livery_s3:delete_object(C, B, K)
     end.
 
+%%====================================================================
+%% Presigned POST (browser form uploads)
+%%====================================================================
+
+post_upload(Config) ->
+    maybe
+        ok ?= require(post_object, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"post-">>),
+        {ok, Form} = livery_s3:presign_post(C, B, K, 300, #{
+            content_type => <<"text/plain">>,
+            fields => #{<<"x-amz-meta-origin">> => <<"browser">>}
+        }),
+        {Status, _} = post_form(Form, <<"form body">>, <<"text/plain">>),
+        ?assert(lists:member(Status, [200, 201, 204])),
+        {ok, #{body := <<"form body">>, metadata := Meta}} = livery_s3:get_object(C, B, K),
+        ?assertEqual(#{<<"origin">> => <<"browser">>}, Meta),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
+%% `${filename}` is filled in from the uploaded file's name.
+post_upload_filename(Config) ->
+    maybe
+        ok ?= require(post_object, Config),
+        {C, B} = ctx(Config),
+        Prefix = uniq(<<"post-fn-">>),
+        {ok, Form} = livery_s3:presign_post(C, B, <<Prefix/binary, "/${filename}">>, 300, #{}),
+        {Status, _} = post_form(Form, <<"named">>, <<"application/octet-stream">>),
+        ?assert(lists:member(Status, [200, 201, 204])),
+        K = <<Prefix/binary, "/upload.txt">>,
+        {ok, #{body := <<"named">>}} = livery_s3:get_object(C, B, K),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
+post_too_large_rejected(Config) ->
+    maybe
+        ok ?= require(post_object, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"post-big-">>),
+        {ok, Form} = livery_s3:presign_post(C, B, K, 300, #{content_length_range => {1, 10}}),
+        {Status, Body} = post_form(Form, binary:copy(<<"x">>, 100), <<"text/plain">>),
+        ct:pal("oversized POST -> ~p ~s", [Status, Body]),
+        ?assert(Status >= 400),
+        ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K))
+    end.
+
+post_expired_rejected(Config) ->
+    maybe
+        ok ?= require(post_object, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"post-exp-">>),
+        {ok, Form} = livery_s3:presign_post(C, B, K, 1, #{}),
+        timer:sleep(2500),
+        {Status, Body} = post_form(Form, <<"late">>, <<"text/plain">>),
+        ct:pal("expired POST -> ~p ~s", [Status, Body]),
+        ?assert(Status >= 400),
+        ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K))
+    end.
+
+%% Send a presigned form the way a browser does: every field, then the file.
+post_form(#{url := Url, fields := Fields}, Data, ContentType) ->
+    Boundary = <<"livery-s3-boundary">>,
+    Part = fun(Name, Value) ->
+        [
+            <<"--", Boundary/binary, "\r\n">>,
+            <<"Content-Disposition: form-data; name=\"", Name/binary, "\"\r\n\r\n">>,
+            Value,
+            <<"\r\n">>
+        ]
+    end,
+    Body = iolist_to_binary([
+        [Part(N, V) || {N, V} <- maps:to_list(Fields)],
+        <<"--", Boundary/binary, "\r\n">>,
+        <<"Content-Disposition: form-data; name=\"file\"; filename=\"upload.txt\"\r\n">>,
+        <<"Content-Type: ", ContentType/binary, "\r\n\r\n">>,
+        Data,
+        <<"\r\n--", Boundary/binary, "--\r\n">>
+    ]),
+    Headers = [{<<"content-type">>, <<"multipart/form-data; boundary=", Boundary/binary>>}],
+    {ok, Status, _, RespBody} = hackney:request(post, Url, Headers, Body, [{with_body, true}]),
+    {Status, RespBody}.
+
 anon_client(Config) ->
     Opts = ?config(opts, Config),
     livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
@@ -619,9 +709,9 @@ backend() ->
 %% endpoint), and it accepts SSE-S3/SSE-KMS headers without encrypting.
 %% MinIO: refuses SSE-C over plain HTTP, and the test container has no TLS.
 capabilities(garage) ->
-    [checksums, sse_c];
+    [checksums, sse_c, post_object];
 capabilities(minio) ->
-    [anonymous, checksums, sse_s3, sse_kms].
+    [anonymous, checksums, sse_s3, sse_kms, post_object].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->

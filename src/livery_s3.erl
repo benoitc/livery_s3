@@ -35,7 +35,7 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 -include("livery_s3.hrl").
 
 %% Construction.
--export([new/1, presign/5, presign/6]).
+-export([new/1, presign/5, presign/6, presign_post/5]).
 %% Objects.
 -export([put_object/4, put_object/5]).
 -export([get_object/3, get_object/4]).
@@ -280,6 +280,35 @@ presign(#s3_client{config = Cfg}, Method, Bucket, Key, Expires, Opts) ->
                 livery_s3_sigv4:presigned_url(
                     Cfg, Creds, Method, Bucket, Key, Expires, Extra, Now
                 )};
+        anonymous ->
+            {error, {credentials, anonymous}};
+        {error, Reason} ->
+            {error, {credentials, Reason}}
+    end.
+
+-doc """
+Presign a browser form upload (HTTP POST) of `Key` into `Bucket`, valid for
+`Expires` seconds. Returns `{ok, #{url => Url, fields => Fields}}`: render a
+`multipart/form-data` form that POSTs to `Url` with every entry of `Fields` as a
+form field, followed by the `file` field. The signed policy limits the upload:
+
+* `Key` may end in `${filename}`, completed by the browser from the chosen
+  file; the policy then pins only the part before it. `key_starts_with =>
+  Prefix` allows any key under `Prefix`.
+* `content_length_range => {Min, Max}` - accepted file size in bytes.
+* `content_type => CT` - adds a `Content-Type` field the upload must keep;
+  `content_type_starts_with => <<"image/">>` allows a family instead.
+* `fields => #{Name => Value}` - extra fields signed as exact matches, e.g.
+  `<<"acl">>`, `<<"success_action_status">>`, `<<"x-amz-meta-...">>`.
+* `conditions => [Condition]` - raw policy conditions, for anything else.
+""".
+-spec presign_post(client(), bucket(), key(), pos_integer(), map()) ->
+    {ok, #{url := binary(), fields := #{binary() => binary()}}} | {error, reason()}.
+presign_post(#s3_client{config = Cfg}, Bucket, Key, Expires, Opts) ->
+    case livery_s3_credentials:current(Cfg#s3_config.credentials) of
+        {ok, Creds} ->
+            Now = livery_s3_sigv4:now_timestamps(),
+            {ok, livery_s3_sigv4:presigned_post(Cfg, Creds, Bucket, Key, Expires, Opts, Now)};
         anonymous ->
             {error, {credentials, anonymous}};
         {error, Reason} ->
