@@ -72,7 +72,9 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 -record(s3_client, {
     config :: #s3_config{},
     http :: livery_client:client(),
-    timeout :: timeout()
+    timeout :: timeout(),
+    %% Sent (and signed) on every request: requester-pays, expected owner.
+    headers = [] :: [{binary(), binary()}]
 }).
 
 -opaque client() :: #s3_client{}.
@@ -122,6 +124,12 @@ Build a client. Options:
 * `addressing` - `path` (default) or `virtual` (`bucket.host`).
 * `timeout` - per-request timeout in ms (default 30000), applied by the
   transport (hackney `recv_timeout`).
+* `request_payer => requester` - accept the request charges of a Requester
+  Pays bucket (`x-amz-request-payer`); also added to presigned URLs.
+* `expected_bucket_owner => AccountId` - make AWS reject a request when the
+  bucket belongs to another account (`x-amz-expected-bucket-owner`).
+
+Both are AWS features; other stores ignore the headers.
 
 Resilience (built on `livery_client` layers, outermost to innermost
 `[concurrency, circuit_breaker, retry, balance, signing]`):
@@ -167,7 +175,21 @@ new(Opts) ->
         adapter_opts => maps:get(adapter_opts, Opts, #{}),
         stack => build_stack(Cfg, Opts)
     }),
-    #s3_client{config = Cfg, http = Http, timeout = maps:get(timeout, Opts, 30000)}.
+    #s3_client{
+        config = Cfg,
+        http = Http,
+        timeout = maps:get(timeout, Opts, 30000),
+        headers = account_headers(Opts)
+    }.
+
+-spec account_headers(map()) -> [{binary(), binary()}].
+account_headers(Opts) ->
+    Payer =
+        case maps:get(request_payer, Opts, undefined) of
+            undefined -> [];
+            requester -> [{<<"x-amz-request-payer">>, <<"requester">>}]
+        end,
+    Payer ++ opt_header(<<"x-amz-expected-bucket-owner">>, expected_bucket_owner, Opts).
 
 %% Static `access_key_id`/`secret_access_key` are shorthand for a {static, ...}
 %% provider; otherwise `credentials` names a provider. One is required.
@@ -276,11 +298,12 @@ a browser or any HTTP client.
 """.
 -spec presign(client(), atom() | binary(), bucket(), key(), pos_integer(), map()) ->
     {ok, binary()} | {error, reason()}.
-presign(#s3_client{config = Cfg}, Method, Bucket, Key, Expires, Opts) ->
+presign(#s3_client{config = Cfg, headers = Account}, Method, Bucket, Key, Expires, Opts) ->
     case livery_s3_credentials:current(Cfg#s3_config.credentials) of
         {ok, Creds} ->
             Now = livery_s3_sigv4:now_timestamps(),
-            Extra = version_query(Opts) ++ response_query(Opts),
+            Payer = [P || {<<"x-amz-request-payer">>, _} = P <- Account],
+            Extra = version_query(Opts) ++ response_query(Opts) ++ Payer,
             {ok,
                 livery_s3_sigv4:presigned_url(
                     Cfg, Creds, Method, Bucket, Key, Expires, Extra, Now
@@ -942,9 +965,9 @@ delete_objects(Client, Bucket, Keys) ->
     map()
 ) -> livery_client:result().
 request(Client, Method, Bucket, Key, Query, Headers, Body, ReqOpts) ->
-    #s3_client{config = Cfg, http = Http, timeout = Timeout} = Client,
+    #s3_client{config = Cfg, http = Http, timeout = Timeout, headers = Account} = Client,
     {Url, _Authority} = livery_s3_uri:request_target(Cfg, Bucket, Key, Query),
-    Opts = ReqOpts#{headers => Headers, body => Body, timeout => Timeout},
+    Opts = ReqOpts#{headers => Headers ++ Account, body => Body, timeout => Timeout},
     livery_client:request(Http, Method, Url, Opts).
 
 -spec on_2xx(livery_client:response(), fun((livery_client:response()) -> Ret)) ->
