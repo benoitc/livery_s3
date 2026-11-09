@@ -157,6 +157,8 @@ jobs:
       - name: Common Test
         run: rebar3 ct --suite test/livery_s3_garage_SUITE
         env:
+          LIVERY_S3_BACKEND: ${{ matrix.store }}
+          LIVERY_S3_PUBLIC_BUCKET: ${{ matrix.store == 'minio' && 'livery-s3-public' || '' }}
           LIVERY_S3_ENDPOINT: ${{ matrix.store == 'minio' && 'http://127.0.0.1:9000' || '' }}
           LIVERY_S3_REGION: ${{ matrix.store == 'minio' && 'us-east-1' || '' }}
           LIVERY_S3_ACCESS_KEY: ${{ matrix.store == 'minio' && 'minioadmin' || '' }}
