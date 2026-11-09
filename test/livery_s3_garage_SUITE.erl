@@ -34,7 +34,9 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     upload_part_copy/1,
     presign_response_override/1,
     resilience_stack/1,
-    credential_env_provider/1
+    credential_env_provider/1,
+    anonymous_public_read/1,
+    anonymous_denied_on_private/1
 ]).
 
 all() ->
@@ -60,7 +62,9 @@ all() ->
         upload_part_copy,
         presign_response_override,
         resilience_stack,
-        credential_env_provider
+        credential_env_provider,
+        anonymous_public_read,
+        anonymous_denied_on_private
     ].
 
 init_per_suite(Config) ->
@@ -81,6 +85,7 @@ init_per_suite(Config) ->
             [
                 {client, Client},
                 {opts, Opts},
+                {backend, backend()},
                 {bucket, env("LIVERY_S3_BUCKET", <<"livery-s3-test">>)}
                 | Config
             ];
@@ -407,11 +412,74 @@ credential_env_provider(Config) ->
     end.
 
 %%====================================================================
+%% Anonymous access
+%%====================================================================
+
+%% A signed client writes into the public bucket; an anonymous client reads,
+%% heads, and lists it with no credentials at all.
+anonymous_public_read(Config) ->
+    maybe
+        ok ?= require(anonymous, Config),
+        {C, _} = ctx(Config),
+        Pub = env("LIVERY_S3_PUBLIC_BUCKET", <<"livery-s3-public">>),
+        K = uniq(<<"anon-">>),
+        {ok, _} = livery_s3:put_object(C, Pub, K, <<"open data">>),
+        A = anon_client(Config),
+        {ok, #{body := <<"open data">>}} = livery_s3:get_object(A, Pub, K),
+        {ok, #{content_length := 9}} = livery_s3:head_object(A, Pub, K),
+        {ok, #{objects := Objects}} = livery_s3:list_objects(A, Pub, #{prefix => K}),
+        ?assertEqual([K], [maps:get(key, O) || O <- Objects]),
+        ok = livery_s3:delete_object(C, Pub, K)
+    end.
+
+%% The private bucket rejects an anonymous write and an anonymous read. Every
+%% store must refuse, so this runs everywhere.
+anonymous_denied_on_private(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"anon-priv-">>),
+    {ok, _} = livery_s3:put_object(C, B, K, <<"secret">>),
+    A = anon_client(Config),
+    W = livery_s3:put_object(A, B, uniq(<<"anon-w-">>), <<"x">>),
+    R = livery_s3:get_object(A, B, K),
+    ct:pal("anonymous write -> ~p~nanonymous read -> ~p", [W, R]),
+    ?assertMatch({error, {s3, _, _, #{status := 403}}}, W),
+    ?assertMatch({error, {s3, _, _, #{status := 403}}}, R),
+    ok = livery_s3:delete_object(C, B, K).
+
+anon_client(Config) ->
+    Opts = ?config(opts, Config),
+    livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
+        credentials => anonymous
+    }).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
 ctx(Config) ->
     {?config(client, Config), ?config(bucket, Config)}.
+
+%% Which store the suite runs against; selects the capability table below.
+backend() ->
+    case os:getenv("LIVERY_S3_BACKEND") of
+        "minio" -> minio;
+        _ -> garage
+    end.
+
+%% Features each store implements. Every entry was checked against the real
+%% server; a testcase for a missing capability skips instead of passing silently.
+capabilities(garage) ->
+    [];
+capabilities(minio) ->
+    [anonymous].
+
+%% Skip the calling testcase when the backend lacks `Cap`.
+require(Cap, Config) ->
+    Backend = ?config(backend, Config),
+    case lists:member(Cap, capabilities(Backend)) of
+        true -> ok;
+        false -> {skip, {Backend, lacks, Cap}}
+    end.
 
 env(Name, Default) ->
     case os:getenv(Name) of

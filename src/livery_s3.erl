@@ -103,7 +103,9 @@ Build a client. Options:
   to source them from the environment, the shared config file, EC2/ECS instance
   metadata, web-identity/STS, or the `default` chain. See `livery_s3_credentials`.
   Refreshing providers (`imds`, `{web_identity, _}`) need the `livery_s3`
-  application started.
+  application started. `credentials => anonymous` sends every request
+  unsigned, for public buckets; `presign/6` and `presign_post/5` then return
+  `{error, {credentials, anonymous}}`.
 * `region` - default `<<"us-east-1">>`.
 * `addressing` - `path` (default) or `virtual` (`bucket.host`).
 * `timeout` - per-request timeout in ms (default 30000), applied by the
@@ -271,6 +273,8 @@ presign(#s3_client{config = Cfg}, Method, Bucket, Key, Expires, Opts) ->
                 livery_s3_sigv4:presigned_url(
                     Cfg, Creds, Method, Bucket, Key, Expires, Extra, Now
                 )};
+        anonymous ->
+            {error, {credentials, anonymous}};
         {error, Reason} ->
             {error, {credentials, Reason}}
     end.

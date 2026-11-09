@@ -41,4 +41,9 @@ done
 docker exec "$NAME" mc alias set local http://127.0.0.1:9000 "$ACCESS_KEY" "$SECRET_KEY" >/dev/null
 docker exec "$NAME" mc mb --ignore-existing "local/$BUCKET" >/dev/null
 
-echo "MinIO ready: endpoint=http://127.0.0.1:9000 region=us-east-1 bucket=$BUCKET key=$ACCESS_KEY"
+# A second bucket readable without credentials, for the anonymous-access tests.
+PUBLIC_BUCKET=${LIVERY_S3_PUBLIC_BUCKET:-livery-s3-public}
+docker exec "$NAME" mc mb --ignore-existing "local/$PUBLIC_BUCKET" >/dev/null
+docker exec "$NAME" mc anonymous set download "local/$PUBLIC_BUCKET" >/dev/null
+
+echo "MinIO ready: endpoint=http://127.0.0.1:9000 region=us-east-1 bucket=$BUCKET public=$PUBLIC_BUCKET key=$ACCESS_KEY"
