@@ -13,6 +13,10 @@ AWS Signature V4.
 - Byte ranges and streaming up/downloads
 - Conditional requests (`if_match`/`if_none_match`/`if_modified_since`),
   `Content-MD5`, and GET/presign response-header overrides
+- Integrity checksums (CRC32, CRC32C, SHA1, SHA256) on uploads, parts and reads
+- Server-side encryption: SSE-S3, SSE-KMS, and customer keys (SSE-C)
+- Object tagging: `put_object_tagging`, `get_object_tagging`,
+  `delete_object_tagging`, and tags at write time
 - Bucket management: `list_buckets`, `create_bucket`, `delete_bucket`,
   `head_bucket`, `get_bucket_location`, `list_objects` (V2, with pagination via
   `list_objects_all`)
@@ -20,12 +24,14 @@ AWS Signature V4.
   `put_bucket_versioning`, `list_object_versions`, versioned get/delete
 - Multipart upload (`create`/`upload_part`/`complete`/`abort`,
   `upload_part_copy`, `list_parts`, `list_multipart_uploads`)
-- Batch delete and presigned URLs (`presign`)
+- Batch delete, presigned URLs (`presign`), and presigned POST browser uploads
+  (`presign_post`)
 - Resilience via livery_client layers: retries (on by default), circuit breaker,
   concurrency cap, multi-endpoint balancing
 - Credential providers: static, env, shared config file, EC2/ECS instance
   metadata (IMDS), web-identity/STS, and a default chain, with refresh of
-  temporary credentials
+  temporary credentials; `anonymous` for public buckets
+- Requester Pays and expected-bucket-owner options for AWS
 - Path-style (default) and virtual-hosted addressing; AWS SigV4 signing with
   session-token support
 
@@ -99,6 +105,7 @@ livery_s3:new(#{endpoint => E, region => R, credentials => env}).        %% AWS_
 livery_s3:new(#{endpoint => E, region => R, credentials => {file, <<"default">>}}).
 livery_s3:new(#{endpoint => E, region => R, credentials => imds}).       %% EC2/ECS role (refreshed)
 livery_s3:new(#{endpoint => E, region => R, credentials => default}).    %% env -> web-identity -> file -> imds
+livery_s3:new(#{endpoint => E, region => R, credentials => anonymous}).  %% unsigned, public buckets
 ```
 
 Refreshing providers (`imds`, `web_identity`) cache and rotate temporary
@@ -123,11 +130,19 @@ rebar3 eunit
 ```
 
 Integration tests run against a real [Garage](https://garagehq.deuxfleurs.fr/)
-in Docker:
+and [MinIO](https://min.io/) in Docker. The two stores implement different
+subsets of S3, so the suite runs against both, and a target fails when a test
+fails:
 
 ```
-make test            # garage-up -> rebar3 ct -> garage-down
+make test            # Garage: garage-up -> rebar3 ct -> garage-down
+make test-minio      # MinIO, same suite
+make test-all        # both
 ```
+
+`LIVERY_S3_BACKEND` (`garage` or `minio`) selects the capability table in the
+suite: a test for a feature the store lacks (tagging on Garage, SSE-C over plain
+HTTP on MinIO, ...) is skipped, not passed.
 
 or manually:
 

@@ -115,6 +115,86 @@ end,
                                #{content_md5 => true}).
 ```
 
+## Integrity checksums
+
+S3 can verify an upload with a CRC32, CRC32C, SHA1 or SHA256 checksum you send
+alongside it, and return the stored checksum on a read. Use it when you need
+end-to-end integrity beyond TCP and TLS, or when a store or bucket policy
+requires a checksum.
+
+```erlang
+%% The client computes the checksum; the store rejects a mismatch.
+{ok, #{checksum := #{crc32c := Sum}}} =
+    livery_s3:put_object(C, <<"photos">>, <<"cat.jpg">>, Bytes, #{checksum => crc32c}),
+
+%% A streamed body is not in memory: pass a value you computed.
+{ok, _} = livery_s3:put_object(C, <<"photos">>, <<"big.bin">>, {stream, Producer},
+                               #{checksum => {sha256, Base64Sha256}}),
+
+%% Ask for the stored checksum on read, then verify the bytes yourself.
+{ok, #{body := Body, checksum := #{crc32c := Sum}}} =
+    livery_s3:get_object(C, <<"photos">>, <<"cat.jpg">>, #{checksum_mode => true}),
+Sum = livery_s3_checksum:compute(crc32c, Body).
+```
+
+For a multipart upload, choose the algorithm when you create it, checksum each
+part, and pass each part's checksums to the completion:
+
+```erlang
+{ok, U} = livery_s3:create_multipart_upload(C, B, K, #{checksum_algorithm => crc32c}),
+{ok, #{etag := E1, checksum := S1}} = livery_s3:upload_part(C, B, K, U, 1, P1, #{checksum => crc32c}),
+{ok, #{etag := E2, checksum := S2}} = livery_s3:upload_part(C, B, K, U, 2, P2, #{checksum => crc32c}),
+{ok, _} = livery_s3:complete_multipart_upload(C, B, K, U, [{1, E1, S1}, {2, E2, S2}]).
+```
+
+- A mismatch comes back as an S3 error with status 400 (`BadDigest` or
+  `InvalidRequest`, depending on the store).
+- `checksum => Alg` on a `{stream, _}` body returns
+  `{error, {checksum_requires_full_body, Alg}}` without sending anything.
+- Garage and MinIO both verify all four algorithms.
+
+## Server-side encryption
+
+S3 can encrypt objects at rest with keys it manages (SSE-S3), with a KMS key
+(SSE-KMS), or with a key you supply on every request (SSE-C). Use it when data
+must be encrypted at rest and the bucket has no default encryption, or when you
+must hold the key yourself.
+
+```erlang
+%% SSE-S3: keys managed by the store.
+{ok, #{sse := <<"AES256">>}} =
+    livery_s3:put_object(C, B, K, Bytes, #{sse => aes256}),
+
+%% SSE-KMS with a named key, an encryption context, and an S3 Bucket Key.
+{ok, _} = livery_s3:put_object(C, B, K, Bytes, #{
+    sse => {kms, <<"arn:aws:kms:eu-west-1:111122223333:key/...">>},
+    sse_kms_context => #{<<"project">> => <<"atlas">>},
+    bucket_key_enabled => true
+}),
+
+%% SSE-C: you hold the 256-bit key. Every read needs it too.
+Key = crypto:strong_rand_bytes(32),
+{ok, _} = livery_s3:put_object(C, B, K, Bytes, #{sse_customer_key => Key}),
+{ok, #{body := Bytes}} = livery_s3:get_object(C, B, K, #{sse_customer_key => Key}),
+
+%% Copy an SSE-C object under a new key.
+{ok, _} = livery_s3:copy_object(C, B, K, B, K2, #{
+    copy_source_sse_customer_key => Key,
+    sse_customer_key => NewKey
+}).
+```
+
+- The same options work on `create_multipart_upload/4`. With SSE-C, pass
+  `sse_customer_key` to every `upload_part/7` and `upload_part_copy/8` too.
+- `head_object/4` takes `sse_customer_key` and reports `sse`,
+  `sse_kms_key_id`, `sse_customer_algorithm` and `bucket_key_enabled`.
+- A key that is not 32 bytes returns `{error, invalid_sse_customer_key}`
+  without sending anything. If you lose an SSE-C key, the object is
+  unreadable.
+- Store support: AWS has all three. MinIO has SSE-S3 and SSE-KMS once a KMS is
+  configured, and SSE-C over TLS only. Garage has SSE-C and ignores the SSE-S3
+  and SSE-KMS headers.
+
 ## Response-header overrides
 
 `get_object/4` and `presign/6` accept `response_content_type`,
@@ -172,6 +252,22 @@ ok = livery_s3:create_bucket(C, <<"eu-bucket">>,
 
 ok = livery_s3:delete_bucket(C, <<"photos">>).   %% must be empty
 ```
+
+## Keys with special characters in listings
+
+XML cannot carry some characters, such as most control characters, so S3 can
+URL-encode the keys in a listing response. Pass `encoding_type => url` when your
+keys may hold such characters. The client decodes the keys, so the result holds
+the original keys.
+
+```erlang
+{ok, #{objects := Objects, common_prefixes := Prefixes}} =
+    livery_s3:list_objects(C, <<"logs">>, #{prefix => <<"2026/">>, encoding_type => url}).
+```
+
+- `list_object_versions/3` and `list_multipart_uploads/3` take the same
+  option.
+- `livery_s3_uri:decode/1` is the decoder, if you need it elsewhere.
 
 ## Versioning (history)
 
@@ -268,6 +364,35 @@ binaries or `{Key, VersionId}` tuples; the result is
                              [<<"a.jpg">>, <<"b.jpg">>, {<<"c.jpg">>, VersionId}]).
 ```
 
+## Object tagging
+
+Tags are key/value pairs on an object, used by lifecycle rules, access policies
+and cost reports. Set them when you write the object or later, and read or
+remove them at any time.
+
+| Operation | Function |
+|-----------|----------|
+| Replace the tag set | `put_object_tagging/4,5` |
+| Read the tag set | `get_object_tagging/3,4` |
+| Remove every tag | `delete_object_tagging/3,4` |
+
+```erlang
+%% Tag at write time.
+{ok, _} = livery_s3:put_object(C, B, K, Bytes, #{tagging => #{<<"team">> => <<"data">>}}),
+
+%% Replace, read, remove.
+ok = livery_s3:put_object_tagging(C, B, K, #{<<"stage">> => <<"archived">>}),
+{ok, #{<<"stage">> := <<"archived">>}} = livery_s3:get_object_tagging(C, B, K),
+ok = livery_s3:delete_object_tagging(C, B, K).
+```
+
+- The 5-arity forms take `version_id`.
+- `copy_object/6` keeps the source's tags unless you pass `tagging`, which
+  replaces them.
+- S3 allows up to 10 tags per object; keys and values may hold letters,
+  digits, spaces and `+ - = . _ : / @`.
+- AWS and MinIO support tagging. Garage does not (`NotImplemented`).
+
 ## Presigned URLs
 
 `presign/5,6` returns a time-limited URL (query-string SigV4, `host` the only
@@ -281,6 +406,43 @@ signed header). Works for any method; `Opts` may carry `version_id` and the
 %% Presign an upload target valid for 15 minutes.
 {ok, PutUrl} = livery_s3:presign(C, put, <<"photos">>, <<"new.jpg">>, 900).
 ```
+
+## Presigned POST (browser uploads)
+
+A presigned POST lets a browser upload a file straight to a bucket with an HTML
+form, under a signed policy that limits what it may upload. Use it when users
+upload from a web page and you do not want the bytes to pass through your
+server. Unlike a presigned PUT URL, the policy can cap the file size and
+restrict the key and content type.
+
+```erlang
+{ok, #{url := Url, fields := Fields}} =
+    livery_s3:presign_post(C, <<"uploads">>, <<"user/42/${filename}">>, 900, #{
+        content_length_range => {1, 10 * 1024 * 1024},
+        content_type_starts_with => <<"image/">>,
+        fields => #{<<"success_action_status">> => <<"201">>}
+    }).
+```
+
+Render a `multipart/form-data` form that POSTs to `Url`, with one hidden input
+per entry of `Fields`, then the file input, which must be named `file` and come
+last:
+
+```html
+<form action="{Url}" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="key" value="{key}">
+  <!-- ... every other entry of Fields ... -->
+  <input type="file" name="file">
+</form>
+```
+
+- `${filename}` in the key is replaced by the name of the file the user picks;
+  the policy then pins only the part of the key before it. Use
+  `key_starts_with` to allow any key under a prefix.
+- `content_type => CT` adds a `Content-Type` field the upload must keep.
+- `fields` entries are signed as exact matches. `conditions` adds raw policy
+  conditions.
+- Garage and MinIO both accept presigned POST uploads.
 
 ## Resilience
 
@@ -345,6 +507,7 @@ Pass static keys (`access_key_id` + `secret_access_key`, optional
   `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, with refresh.
 - `default` - the env -> web-identity -> file -> imds chain.
 - A `fun/0` or `{Module, Function, Args}` returning `{ok, creds()} | {error, _}`.
+- `anonymous` - no credentials: requests go out unsigned (see below).
 
 ```erlang
 %% Static keys.
@@ -369,6 +532,27 @@ resolved credentials feed SigV4 and work on any store; the providers are
 environment-specific (env/file/static everywhere, IMDS on AWS, web-identity on
 AWS or MinIO STS).
 
+### Anonymous access (public buckets)
+
+Public buckets, such as open datasets, can be read without credentials. Use
+`credentials => anonymous` to send requests unsigned.
+
+```erlang
+Public = livery_s3:new(#{endpoint => <<"https://s3.amazonaws.com">>,
+                         region => <<"us-east-1">>,
+                         credentials => anonymous}),
+{ok, #{body := Data}} = livery_s3:get_object(Public, <<"open-data">>, <<"index.csv">>).
+```
+
+- The bucket policy decides what an anonymous request may do. A refused one
+  returns an S3 error with status 403.
+- `presign/5,6` and `presign_post/5` need keys, and return
+  `{error, {credentials, anonymous}}`.
+- The `default` provider chain never falls back to anonymous; you have to ask
+  for it.
+- Garage serves anonymous reads only through its website endpoint, not the S3
+  API.
+
 ## Addressing and compatibility
 
 - `addressing => path` (default) keeps the bucket in the URL path; works with
@@ -377,7 +561,22 @@ AWS or MinIO STS).
 - Requests are signed with AWS Signature V4; `session_token` and rotating
   temporary credentials are supported.
 
+### Requester pays and expected bucket owner
+
+Two AWS account guards, set once on the client and sent on every request:
+
+```erlang
+C = livery_s3:new(#{endpoint => E, region => R, credentials => default,
+                    %% You accept the charges of a Requester Pays bucket.
+                    request_payer => requester,
+                    %% AWS rejects the request if another account owns the bucket.
+                    expected_bucket_owner => <<"111122223333">>}).
+```
+
+- `request_payer` is also added to presigned URLs.
+- Stores other than AWS ignore both headers.
+
 ## Not in scope (yet)
 
-ACL/policy/CORS/lifecycle/tagging subresources, SSE-C/KMS encryption headers,
-SigV2, request-payer, and object lock.
+ACL/policy/CORS/lifecycle subresources, bucket tagging, object lock, and
+SigV2.

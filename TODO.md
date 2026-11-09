@@ -19,11 +19,11 @@ Remaining S3 features, by tier. Checked items are implemented; see
 
 ## Planned: AWS / not universal across S3-compatible stores
 
-- [ ] Object tagging (`PutObjectTagging` / `GetObjectTagging` /
+- [x] Object tagging (`PutObjectTagging` / `GetObjectTagging` /
       `DeleteObjectTagging`, `x-amz-tagging` on put)
 - [ ] Object ACL get/set (`GetObjectAcl` / `PutObjectAcl`)
-- [ ] Server-side encryption (SSE-S3, SSE-KMS, SSE-C)
-- [ ] Integrity checksums (`x-amz-checksum-crc32/crc32c/sha1/sha256`)
+- [x] Server-side encryption (SSE-S3, SSE-KMS, SSE-C)
+- [x] Integrity checksums (`x-amz-checksum-crc32/crc32c/sha1/sha256`)
 - [ ] `GetObjectAttributes`
 - [ ] Object Lock / legal hold / retention
 - [ ] Glacier `RestoreObject`
@@ -43,14 +43,14 @@ Remaining S3 features, by tier. Checked items are implemented; see
 ## Planned: convenience and robustness (not raw API)
 
 - [ ] High-level "upload a large file/stream as multipart" helper
-- [ ] Presigned POST (browser form-upload policy)
+- [x] Presigned POST (browser form-upload policy)
 - [x] Automatic retries/backoff on transient 5xx / connection errors (retry on by
       default; circuit breaker, concurrency cap, and multi-endpoint balancing via
       livery_client layers, opt-in)
 - [x] Region-redirect handling (AWS `301 PermanentRedirect` / `400
       AuthorizationHeaderMalformed`; re-sign + retry once, on by default)
 - [x] Honor `Retry-After` on 503/429 (added to livery's retry layer upstream)
-- [ ] Anonymous / unsigned requests for public objects
+- [x] Anonymous / unsigned requests for public objects
 - [x] Credential providers and refresh (static, env, file, IMDS, web-identity,
       default chain; refreshing providers cached via the livery_s3 app)
 - [ ] SSO / credential_process / assume-role (non-web-identity) / ECS
