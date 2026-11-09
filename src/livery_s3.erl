@@ -310,15 +310,22 @@ value over a full body and sends it as `x-amz-checksum-<alg>`; the store
 rejects the upload when it does not match. `checksum => {Alg, Base64}` sends a
 value you computed, the only form a `{stream, _}` body accepts. The result
 carries `checksum => #{Alg => Base64}` when the store echoes it.
+
+Server-side encryption (see `livery_s3_sse`): `sse => aes256` (SSE-S3),
+`sse => {kms, KeyId | undefined}` with optional `sse_kms_context` and
+`bucket_key_enabled` (SSE-KMS), or `sse_customer_key => <<_:256>>` (SSE-C). An
+SSE-C object needs the same key on every later read. The result carries `sse`,
+`sse_kms_key_id`, `sse_customer_algorithm` when the store reports them.
 """.
 -spec put_object(client(), bucket(), key(), body(), map()) -> {ok, map()} | {error, reason()}.
 put_object(Client, Bucket, Key, Body, Opts) ->
     Body1 = to_body(Body),
     maybe
-        {ok, Extra} ?= livery_s3_checksum:headers(Opts, Body1),
+        {ok, Sums} ?= livery_s3_checksum:headers(Opts, Body1),
+        {ok, Sse} ?= livery_s3_sse:write_headers(Opts),
         Headers =
             object_write_headers(Opts) ++ conditional_headers(Opts) ++
-                md5_headers(Opts, Body1) ++ Extra,
+                md5_headers(Opts, Body1) ++ Sums ++ Sse,
         {ok, Resp} ?= request(Client, put, Bucket, Key, [], Headers, Body1, #{}),
         case livery_client:status(Resp) of
             S when S >= 200, S < 300 -> {ok, write_result(Resp)};
@@ -346,25 +353,27 @@ Download an object. `Opts`:
   `response_cache_control`, `response_content_encoding`, `response_content_language`,
   `response_expires`.
 * `checksum_mode => true` - ask the store to return the object's checksum.
+* `sse_customer_key` - the SSE-C key the object was written with.
 
 The result map carries `body`, `metadata`, and (when present) `content_type`,
-`content_length`, `etag`, `last_modified`, `version_id`, `checksum`.
+`content_length`, `etag`, `last_modified`, `version_id`, `checksum`, and the
+encryption fields.
 """.
 -spec get_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 get_object(Client, Bucket, Key, Opts) ->
     Stream = maps:get(stream, Opts, false),
-    Headers = range_headers(Opts) ++ conditional_headers(Opts) ++ checksum_mode_header(Opts),
     Query = version_query(Opts) ++ response_query(Opts),
-    case request(Client, get, Bucket, Key, Query, Headers, empty, #{stream => Stream}) of
-        {ok, Resp} ->
-            case livery_client:status(Resp) of
-                S when S =:= 200; S =:= 206 -> {ok, read_result(Resp, Stream)};
-                304 -> {error, not_modified};
-                412 -> {error, precondition_failed};
-                _ -> decode_error(Resp)
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
+        Headers =
+            range_headers(Opts) ++ conditional_headers(Opts) ++ checksum_mode_header(Opts) ++ Sse,
+        {ok, Resp} ?= request(Client, get, Bucket, Key, Query, Headers, empty, #{stream => Stream}),
+        case livery_client:status(Resp) of
+            S when S =:= 200; S =:= 206 -> {ok, read_result(Resp, Stream)};
+            304 -> {error, not_modified};
+            412 -> {error, precondition_failed};
+            _ -> decode_error(Resp)
+        end
     end.
 
 -doc "Fetch object metadata without the body. Missing object yields `not_found`.".
@@ -373,25 +382,24 @@ head_object(Client, Bucket, Key) ->
     head_object(Client, Bucket, Key, #{}).
 
 -doc """
-Fetch object metadata. `Opts` may carry `version_id`, `checksum_mode`, and the
-same conditional headers as `get_object/4` (`304` -> `not_modified`, `412` ->
-`precondition_failed`).
+Fetch object metadata. `Opts` may carry `version_id`, `checksum_mode`,
+`sse_customer_key`, and the same conditional headers as `get_object/4` (`304`
+-> `not_modified`, `412` -> `precondition_failed`).
 """.
 -spec head_object(client(), bucket(), key(), map()) -> {ok, map()} | {error, reason()}.
 head_object(Client, Bucket, Key, Opts) ->
     Query = version_query(Opts),
-    Headers = conditional_headers(Opts) ++ checksum_mode_header(Opts),
-    case request(Client, head, Bucket, Key, Query, Headers, empty, #{}) of
-        {ok, Resp} ->
-            case livery_client:status(Resp) of
-                200 -> {ok, object_meta(Resp)};
-                304 -> {error, not_modified};
-                412 -> {error, precondition_failed};
-                404 -> {error, not_found};
-                _ -> decode_error(Resp)
-            end;
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
+        Headers = conditional_headers(Opts) ++ checksum_mode_header(Opts) ++ Sse,
+        {ok, Resp} ?= request(Client, head, Bucket, Key, Query, Headers, empty, #{}),
+        case livery_client:status(Resp) of
+            200 -> {ok, object_meta(Resp)};
+            304 -> {error, not_modified};
+            412 -> {error, precondition_failed};
+            404 -> {error, not_found};
+            _ -> decode_error(Resp)
+        end
     end.
 
 -doc "Delete an object. `Opts` may carry `version_id` to delete a version.".
@@ -411,24 +419,27 @@ copy_object(Client, SrcBucket, SrcKey, DstBucket, DstKey) ->
 
 -doc """
 Server-side copy of `SrcBucket/SrcKey` to `DstBucket/DstKey`. `Opts` accepts the
-same write options as `put_object/5`; supplying `metadata` switches the metadata
-directive to `REPLACE`.
+same write options as `put_object/5`, including encryption of the copy;
+supplying `metadata` switches the metadata directive to `REPLACE`. An SSE-C
+source needs `copy_source_sse_customer_key`.
 """.
 -spec copy_object(client(), bucket(), key(), bucket(), key(), map()) ->
     {ok, map()} | {error, reason()}.
 copy_object(Client, SrcBucket, SrcKey, DstBucket, DstKey, Opts) ->
-    Headers0 = [
-        {<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)}
-        | object_write_headers(Opts)
-    ],
-    Headers =
-        case maps:is_key(metadata, Opts) of
-            true -> [{<<"x-amz-metadata-directive">>, <<"REPLACE">>} | Headers0];
-            false -> Headers0
-        end,
-    case request(Client, put, DstBucket, DstKey, [], Headers, empty, #{}) of
-        {ok, Resp} -> on_result_xml(Resp, <<"CopyObjectResult">>, fun copy_result/2);
-        {error, _} = E -> E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:write_headers(Opts),
+        {ok, SrcSse} ?= livery_s3_sse:copy_source_headers(Opts),
+        Headers0 = [
+            {<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)}
+            | object_write_headers(Opts) ++ Sse ++ SrcSse
+        ],
+        Headers =
+            case maps:is_key(metadata, Opts) of
+                true -> [{<<"x-amz-metadata-directive">>, <<"REPLACE">>} | Headers0];
+                false -> Headers0
+            end,
+        {ok, Resp} ?= request(Client, put, DstBucket, DstKey, [], Headers, empty, #{}),
+        on_result_xml(Resp, <<"CopyObjectResult">>, fun copy_result/2)
     end.
 
 %%====================================================================
@@ -604,19 +615,23 @@ Begin a multipart upload. `Opts` accepts the `put_object/5` write options, plus
 `checksum_algorithm => crc32 | crc32c | sha1 | sha256` to have every part
 checksummed. With it, pass `checksum => Alg` to `upload_part/7` and the
 returned checksums to `complete_multipart_upload/5` as `{N, ETag, Checksums}`.
+
+Encryption options (`sse`, `sse_customer_key`, ...) are chosen here. With
+SSE-C, pass the same `sse_customer_key` to every `upload_part/7` and
+`upload_part_copy/8`.
 """.
 -spec create_multipart_upload(client(), bucket(), key(), map()) ->
     {ok, binary()} | {error, reason()}.
 create_multipart_upload(Client, Bucket, Key, Opts) ->
-    Headers = object_write_headers(Opts) ++ livery_s3_checksum:algorithm_header(Opts),
-    case request(Client, post, Bucket, Key, [{<<"uploads">>, <<>>}], Headers, empty, #{}) of
-        {ok, Resp} ->
-            on_2xx(Resp, fun(R) ->
-                {ok, Tree} = parse_body(R),
-                {ok, livery_s3_xml:text(Tree, <<"UploadId">>)}
-            end);
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:write_headers(Opts),
+        Headers = object_write_headers(Opts) ++ livery_s3_checksum:algorithm_header(Opts) ++ Sse,
+        Query = [{<<"uploads">>, <<>>}],
+        {ok, Resp} ?= request(Client, post, Bucket, Key, Query, Headers, empty, #{}),
+        on_2xx(Resp, fun(R) ->
+            {ok, Tree} = parse_body(R),
+            {ok, livery_s3_xml:text(Tree, <<"UploadId">>)}
+        end)
     end.
 
 -doc "Upload one part (1-based `PartNumber`). See `upload_part/7`.".
@@ -627,8 +642,8 @@ upload_part(Client, Bucket, Key, UploadId, PartNumber, Body) ->
 
 -doc """
 Upload one part (1-based `PartNumber`). `Opts` accepts `checksum` (as in
-`put_object/5`). Returns `#{etag => _}`, plus `checksum` when the store echoes
-one.
+`put_object/5`) and the upload's `sse_customer_key`. Returns `#{etag => _}`,
+plus `checksum` when the store echoes one.
 """.
 -spec upload_part(client(), bucket(), key(), binary(), pos_integer(), body(), map()) ->
     {ok, map()} | {error, reason()}.
@@ -636,8 +651,9 @@ upload_part(Client, Bucket, Key, UploadId, PartNumber, Body, Opts) ->
     Body1 = to_body(Body),
     Query = [{<<"partNumber">>, integer_to_binary(PartNumber)}, {<<"uploadId">>, UploadId}],
     maybe
-        {ok, Headers} ?= livery_s3_checksum:headers(Opts, Body1),
-        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Headers, Body1, #{}),
+        {ok, Sums} ?= livery_s3_checksum:headers(Opts, Body1),
+        {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
+        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Sums ++ Sse, Body1, #{}),
         on_2xx(Resp, fun(R) ->
             {ok, add_checksum(#{etag => unquote(livery_client:header(<<"etag">>, R, <<>>))}, R)}
         end)
@@ -660,6 +676,8 @@ Complete a multipart upload with options. The object is created here, not by
 
 * `if_none_match => <<"*">>` - complete only if the key does not already exist.
 * `if_match => ETag` - complete only if the current object matches `ETag`.
+* `sse_customer_key` - the upload's SSE-C key, for stores or bucket policies
+  that require it on completion.
 
 Outcomes when a concurrent writer races the conditional completion:
 
@@ -682,12 +700,11 @@ decodes to an S3 error.
 complete_multipart_upload(Client, Bucket, Key, UploadId, Parts, Opts) ->
     Body = build_complete_xml(Parts),
     Query = [{<<"uploadId">>, UploadId}],
-    Headers = conditional_headers(Opts),
-    case request(Client, post, Bucket, Key, Query, Headers, {full, Body}, #{}) of
-        {ok, Resp} ->
-            complete_response(Resp, is_conditional_write(Opts));
-        {error, _} = E ->
-            E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
+        Headers = conditional_headers(Opts) ++ Sse,
+        {ok, Resp} ?= request(Client, post, Bucket, Key, Query, Headers, {full, Body}, #{}),
+        complete_response(Resp, is_conditional_write(Opts))
     end.
 
 -spec complete_response(livery_client:response(), boolean()) -> {ok, map()} | {error, reason()}.
@@ -739,22 +756,29 @@ upload_part_copy(Client, Bucket, Key, UploadId, PartNumber, SrcBucket, SrcKey) -
 -doc """
 Upload a part by server-side copy from `SrcBucket/SrcKey`. `Opts`: `range =>
 {Start, End}` copies a byte range of the source; `version_id` selects a source
-version. Returns `#{etag => _}`.
+version; `sse_customer_key` is the upload's SSE-C key and
+`copy_source_sse_customer_key` the source's. Returns `#{etag => _}`.
 """.
 -spec upload_part_copy(
     client(), bucket(), key(), binary(), pos_integer(), bucket(), key(), map()
 ) -> {ok, map()} | {error, reason()}.
 upload_part_copy(Client, Bucket, Key, UploadId, PartNumber, SrcBucket, SrcKey, Opts) ->
-    Headers0 = [{<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)}],
-    Headers =
-        case maps:get(range, Opts, undefined) of
-            undefined -> Headers0;
-            {Start, End} -> [{<<"x-amz-copy-source-range">>, range_value(Start, End)} | Headers0]
-        end,
     Query = [{<<"partNumber">>, integer_to_binary(PartNumber)}, {<<"uploadId">>, UploadId}],
-    case request(Client, put, Bucket, Key, Query, Headers, empty, #{}) of
-        {ok, Resp} -> on_result_xml(Resp, <<"CopyPartResult">>, fun copy_part_result/2);
-        {error, _} = E -> E
+    maybe
+        {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
+        {ok, SrcSse} ?= livery_s3_sse:copy_source_headers(Opts),
+        Headers0 = [
+            {<<"x-amz-copy-source">>, copy_source(SrcBucket, SrcKey, Opts)} | Sse ++ SrcSse
+        ],
+        Headers =
+            case maps:get(range, Opts, undefined) of
+                undefined ->
+                    Headers0;
+                {Start, End} ->
+                    [{<<"x-amz-copy-source-range">>, range_value(Start, End)} | Headers0]
+            end,
+        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Headers, empty, #{}),
+        on_result_xml(Resp, <<"CopyPartResult">>, fun copy_part_result/2)
     end.
 
 -doc "List the parts uploaded so far for a multipart upload. See `list_parts/5`.".
@@ -947,7 +971,8 @@ object_meta(Resp) ->
 %% Fields every object-level result may carry, read from response headers.
 -spec add_response_fields(map(), livery_client:response()) -> map().
 add_response_fields(Map, Resp) ->
-    add_checksum(add_version(Map, Resp), Resp).
+    Sse = livery_s3_sse:from_headers(livery_client:headers(Resp)),
+    maps:merge(add_checksum(add_version(Map, Resp), Resp), Sse).
 
 -spec add_checksum(map(), livery_client:response()) -> map().
 add_checksum(Map, Resp) ->

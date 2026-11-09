@@ -18,6 +18,9 @@ BUCKET=${LIVERY_S3_BUCKET:-livery-s3-test}
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+# MINIO_KMS_SECRET_KEY is a static test key: it enables SSE-S3 and SSE-KMS
+# (key id `livery-s3-key`) for the encryption tests.
+
 # Pre-pull with retries: registry timeouts are a common CI flake.
 for attempt in 1 2 3 4 5; do
   if docker pull "$IMAGE"; then break; fi
@@ -29,6 +32,7 @@ docker run -d --name "$NAME" \
   -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER="$ACCESS_KEY" \
   -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
+  -e MINIO_KMS_SECRET_KEY="livery-s3-key:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
   "$IMAGE" server /data --console-address ":9001" >/dev/null
 
 echo "Waiting for MinIO S3 API on :9000..."
