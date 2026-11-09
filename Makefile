@@ -1,4 +1,4 @@
-.PHONY: compile eunit ct test test-minio test-all check garage-up garage-down minio-up minio-down \
+.PHONY: compile eunit ct test test-rustfs test-all check garage-up garage-down rustfs-up rustfs-down \
 	dialyzer xref lint fmt clean
 
 compile:
@@ -17,19 +17,20 @@ test: garage-up
 	@rc=0; LIVERY_S3_BACKEND=garage rebar3 ct --suite test/livery_s3_garage_SUITE || rc=$$?; \
 	$(MAKE) garage-down; exit $$rc
 
-## Same suite against MinIO, which enforces conditional writes (Garage does not).
-test-minio: minio-up
-	@rc=0; LIVERY_S3_BACKEND=minio \
+## Same suite against RustFS, which implements features Garage lacks (tagging,
+## anonymous access, SSE-S3/SSE-KMS) and enforces conditional writes.
+test-rustfs: rustfs-up
+	@rc=0; LIVERY_S3_BACKEND=rustfs \
 	 LIVERY_S3_ENDPOINT=http://127.0.0.1:9000 \
 	 LIVERY_S3_REGION=us-east-1 \
-	 LIVERY_S3_ACCESS_KEY=minioadmin \
-	 LIVERY_S3_SECRET_KEY=minioadmin \
+	 LIVERY_S3_ACCESS_KEY=rustfsadmin \
+	 LIVERY_S3_SECRET_KEY=rustfsadmin \
 	 LIVERY_S3_PUBLIC_BUCKET=livery-s3-public \
 	 rebar3 ct --suite test/livery_s3_garage_SUITE || rc=$$?; \
-	$(MAKE) minio-down; exit $$rc
+	$(MAKE) rustfs-down; exit $$rc
 
 ## Both integration targets, one after the other.
-test-all: test test-minio
+test-all: test test-rustfs
 
 garage-up:
 	./test/docker/garage-up.sh
@@ -37,11 +38,11 @@ garage-up:
 garage-down:
 	./test/docker/garage-down.sh
 
-minio-up:
-	./test/docker/minio-up.sh
+rustfs-up:
+	./test/docker/rustfs-up.sh
 
-minio-down:
-	./test/docker/minio-down.sh
+rustfs-down:
+	./test/docker/rustfs-down.sh
 
 dialyzer:
 	rebar3 dialyzer

@@ -66,6 +66,8 @@ rebar3 compile                                  # Build
 rebar3 eunit --cover                            # Unit tests with coverage
 rebar3 cover --verbose                          # Coverage report
 make test                                       # garage-up -> rebar3 ct -> garage-down
+make test-rustfs                                # same suite against RustFS
+make test-all                                   # both stores
 ./test/docker/garage-up.sh                      # Start Garage in Docker
 rebar3 ct --suite test/livery_s3_garage_SUITE   # Integration suite
 rebar3 ex_doc                                   # Generate API docs into doc/

@@ -91,7 +91,8 @@ Emit = fun Loop([H | T]) -> {ok, H, fun() -> Loop(T) end};
   `{error, not_modified}` and a `412` becomes `{error, precondition_failed}`.
 - `put_object/5` accepts `if_match` / `if_none_match` for conditional writes
   (e.g. `if_none_match => <<"*">>` for create-if-absent); enforcement is
-  backend-dependent (AWS and MinIO enforce it, Garage currently does not).
+  backend-dependent (AWS, MinIO and RustFS enforce it, Garage currently does
+  not).
 - `complete_multipart_upload/6` accepts the same `if_match` / `if_none_match`.
   A multipart object is created at completion, not at
   `create_multipart_upload/4`, so completion is where the guard belongs.
@@ -151,7 +152,7 @@ part, and pass each part's checksums to the completion:
   `InvalidRequest`, depending on the store).
 - `checksum => Alg` on a `{stream, _}` body returns
   `{error, {checksum_requires_full_body, Alg}}` without sending anything.
-- Garage and MinIO both verify all four algorithms.
+- Garage and RustFS both verify all four algorithms.
 
 ## Server-side encryption
 
@@ -191,9 +192,9 @@ Key = crypto:strong_rand_bytes(32),
 - A key that is not 32 bytes returns `{error, invalid_sse_customer_key}`
   without sending anything. If you lose an SSE-C key, the object is
   unreadable.
-- Store support: AWS has all three. MinIO has SSE-S3 and SSE-KMS once a KMS is
-  configured, and SSE-C over TLS only. Garage has SSE-C and ignores the SSE-S3
-  and SSE-KMS headers.
+- Store support: AWS has all three. RustFS has all three, SSE-S3 and SSE-KMS
+  once a KMS with a default key is configured. MinIO accepts SSE-C over TLS
+  only. Garage has SSE-C and ignores the SSE-S3 and SSE-KMS headers.
 
 ## Response-header overrides
 
@@ -391,7 +392,7 @@ ok = livery_s3:delete_object_tagging(C, B, K).
   replaces them.
 - S3 allows up to 10 tags per object; keys and values may hold letters,
   digits, spaces and `+ - = . _ : / @`.
-- AWS and MinIO support tagging. Garage does not (`NotImplemented`).
+- AWS and RustFS support tagging. Garage does not (`NotImplemented`).
 
 ## Presigned URLs
 
@@ -442,7 +443,7 @@ last:
 - `content_type => CT` adds a `Content-Type` field the upload must keep.
 - `fields` entries are signed as exact matches. `conditions` adds raw policy
   conditions.
-- Garage and MinIO both accept presigned POST uploads.
+- Garage and RustFS both accept presigned POST uploads.
 
 ## Resilience
 

@@ -134,9 +134,10 @@ jobs:
       fail-fast: false
       matrix:
         otp: ['28', '29']
-        # Garage ignores conditional writes, MinIO enforces them: running the
-        # suite against both is what covers the If-Match/If-None-Match paths.
-        store: [garage, minio]
+        # Garage and RustFS implement different subsets of S3 (Garage ignores
+        # conditional writes and lacks tagging): running the suite against both
+        # is what covers every feature.
+        store: [garage, rustfs]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -158,11 +159,11 @@ jobs:
         run: rebar3 ct --suite test/livery_s3_garage_SUITE
         env:
           LIVERY_S3_BACKEND: ${{ matrix.store }}
-          LIVERY_S3_PUBLIC_BUCKET: ${{ matrix.store == 'minio' && 'livery-s3-public' || '' }}
-          LIVERY_S3_ENDPOINT: ${{ matrix.store == 'minio' && 'http://127.0.0.1:9000' || '' }}
-          LIVERY_S3_REGION: ${{ matrix.store == 'minio' && 'us-east-1' || '' }}
-          LIVERY_S3_ACCESS_KEY: ${{ matrix.store == 'minio' && 'minioadmin' || '' }}
-          LIVERY_S3_SECRET_KEY: ${{ matrix.store == 'minio' && 'minioadmin' || '' }}
+          LIVERY_S3_PUBLIC_BUCKET: ${{ matrix.store == 'rustfs' && 'livery-s3-public' || '' }}
+          LIVERY_S3_ENDPOINT: ${{ matrix.store == 'rustfs' && 'http://127.0.0.1:9000' || '' }}
+          LIVERY_S3_REGION: ${{ matrix.store == 'rustfs' && 'us-east-1' || '' }}
+          LIVERY_S3_ACCESS_KEY: ${{ matrix.store == 'rustfs' && 'rustfsadmin' || '' }}
+          LIVERY_S3_SECRET_KEY: ${{ matrix.store == 'rustfs' && 'rustfsadmin' || '' }}
       - name: Stop ${{ matrix.store }}
         if: always()
         run: ./test/docker/${{ matrix.store }}-down.sh
