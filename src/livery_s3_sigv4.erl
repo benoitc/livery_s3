@@ -13,6 +13,9 @@ Used two ways:
   An anonymous client's requests pass through unsigned.
 * As a presigner (`presigned_url/8`): query-string signing for time-limited
   GET/PUT URLs, with `UNSIGNED-PAYLOAD` and `host` as the only signed header.
+* As a POST policy signer (`presigned_post/7`): the form fields a browser sends
+  to upload straight to a bucket, under a signed policy that limits what it may
+  upload.
 
 The pure `authorization/1` primitive computes a signature from explicit inputs;
 it is exercised against AWS's published S3 worked examples in the tests.
@@ -23,6 +26,7 @@ it is exercised against AWS's published S3 worked examples in the tests.
 -export([call/3]).
 -export([authorization/1]).
 -export([presigned_url/8]).
+-export([presigned_post/7, post_signature/4]).
 -export([now_timestamps/0]).
 
 -type sign_input() :: #{
@@ -222,6 +226,114 @@ presigned_url(Cfg, Creds, Method, Bucket, Key, Expires, ExtraQuery, {DateTime, D
     >>.
 
 %%====================================================================
+%% Presigned POST (browser form uploads)
+%%====================================================================
+
+-doc """
+Signature of a base64 POST policy: the hex HMAC-SHA256 of the policy string with
+the SigV4 signing key for `Date` (`yyyymmdd`) and `Region`.
+""".
+-spec post_signature(binary(), binary(), binary(), binary()) -> binary().
+post_signature(Secret, Date, Region, PolicyB64) ->
+    hex_lower(hmac(signing_key(Secret, Date, Region, ?S3_SERVICE), PolicyB64)).
+
+-doc """
+Build the URL and form fields of a presigned POST upload. The policy expires
+`Expires` seconds after `DateTime` and holds one condition per signed field,
+plus the restrictions in `Opts` (see `livery_s3:presign_post/5`).
+""".
+-spec presigned_post(
+    #s3_config{},
+    livery_s3_credentials:creds(),
+    binary(),
+    binary(),
+    pos_integer(),
+    map(),
+    {binary(), binary()}
+) -> #{url := binary(), fields := #{binary() => binary()}}.
+presigned_post(Cfg, Creds, Bucket, Key, Expires, Opts, {DateTime, Date}) ->
+    {Url, _Authority} = livery_s3_uri:request_target(Cfg, Bucket, undefined, []),
+    Region = Cfg#s3_config.region,
+    Scope = <<Date/binary, "/", Region/binary, "/", ?S3_SERVICE/binary, "/aws4_request">>,
+    Auth0 = [
+        {<<"x-amz-algorithm">>, ?SIGV4_ALGORITHM},
+        {<<"x-amz-credential">>, <<(maps:get(access_key_id, Creds))/binary, "/", Scope/binary>>},
+        {<<"x-amz-date">>, DateTime}
+    ],
+    Auth =
+        case maps:get(session_token, Creds, undefined) of
+            undefined -> Auth0;
+            Tok -> Auth0 ++ [{<<"x-amz-security-token">>, Tok}]
+        end,
+    Extra = maps:to_list(maps:get(fields, Opts, #{})) ++ content_type_field(Opts),
+    Signed = Extra ++ Auth,
+    Conditions =
+        [#{<<"bucket">> => Bucket}, key_condition(Key, Opts)] ++
+            [#{N => V} || {N, V} <- Signed] ++
+            post_restrictions(Opts),
+    Policy = #{
+        <<"expiration">> => expiration(DateTime, Expires),
+        <<"conditions">> => Conditions
+    },
+    PolicyB64 = base64:encode(iolist_to_binary(json:encode(Policy))),
+    Sig = post_signature(maps:get(secret_access_key, Creds), Date, Region, PolicyB64),
+    Fields = maps:from_list(
+        [{<<"key">>, Key}, {<<"policy">>, PolicyB64}, {<<"x-amz-signature">>, Sig} | Signed]
+    ),
+    #{url => Url, fields => Fields}.
+
+%% A key holding `${filename}` is completed by the browser, so the policy can
+%% only pin what comes before it. `key_starts_with` widens it explicitly.
+-spec key_condition(binary(), map()) -> map() | [binary()].
+key_condition(Key, Opts) ->
+    case maps:get(key_starts_with, Opts, undefined) of
+        undefined ->
+            case binary:split(Key, <<"${filename}">>) of
+                [Key] -> #{<<"key">> => Key};
+                [Prefix, _] -> [<<"starts-with">>, <<"$key">>, Prefix]
+            end;
+        Prefix ->
+            [<<"starts-with">>, <<"$key">>, Prefix]
+    end.
+
+-spec content_type_field(map()) -> [{binary(), binary()}].
+content_type_field(Opts) ->
+    case maps:get(content_type, Opts, undefined) of
+        undefined -> [];
+        CT -> [{<<"Content-Type">>, CT}]
+    end.
+
+-spec post_restrictions(map()) -> [term()].
+post_restrictions(Opts) ->
+    Range =
+        case maps:get(content_length_range, Opts, undefined) of
+            undefined -> [];
+            {Min, Max} -> [[<<"content-length-range">>, Min, Max]]
+        end,
+    TypePrefix =
+        case maps:get(content_type_starts_with, Opts, undefined) of
+            undefined -> [];
+            P -> [[<<"starts-with">>, <<"$Content-Type">>, P]]
+        end,
+    Range ++ TypePrefix ++ maps:get(conditions, Opts, []).
+
+%% `20151229T000000Z` plus `Expires` seconds, as `2015-12-29T01:00:00.000Z`.
+-spec expiration(binary(), pos_integer()) -> binary().
+expiration(DateTime, Expires) ->
+    <<Y:4/binary, Mo:2/binary, D:2/binary, "T", H:2/binary, Mi:2/binary, S:2/binary, "Z">> =
+        DateTime,
+    Start = calendar:datetime_to_gregorian_seconds(
+        {
+            {binary_to_integer(Y), binary_to_integer(Mo), binary_to_integer(D)},
+            {binary_to_integer(H), binary_to_integer(Mi), binary_to_integer(S)}
+        }
+    ),
+    format_datetime(
+        "~4..0w-~2..0w-~2..0wT~2..0w:~2..0w:~2..0w.000Z",
+        calendar:gregorian_seconds_to_datetime(Start + Expires)
+    ).
+
+%%====================================================================
 %% Canonicalization helpers
 %%====================================================================
 
@@ -292,11 +404,12 @@ method_bin(M) when is_binary(M) -> string:uppercase(M).
 -doc "Return the current `{amz-datetime, yyyymmdd}` pair in UTC.".
 -spec now_timestamps() -> {binary(), binary()}.
 now_timestamps() ->
-    {{Y, Mo, D}, {H, Mi, S}} = calendar:universal_time(),
-    DateTime = iolist_to_binary(
-        io_lib:format("~4..0w~2..0w~2..0wT~2..0w~2..0w~2..0wZ", [Y, Mo, D, H, Mi, S])
-    ),
+    DateTime = format_datetime("~4..0w~2..0w~2..0wT~2..0w~2..0w~2..0wZ", calendar:universal_time()),
     {DateTime, binary:part(DateTime, 0, 8)}.
+
+-spec format_datetime(string(), calendar:datetime()) -> binary().
+format_datetime(Format, {{Y, Mo, D}, {H, Mi, S}}) ->
+    iolist_to_binary(io_lib:format(Format, [Y, Mo, D, H, Mi, S])).
 
 -spec upsert_all([{binary(), binary()}], [{binary(), binary()}]) -> [{binary(), binary()}].
 upsert_all(Headers, Adds) ->
