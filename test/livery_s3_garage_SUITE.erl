@@ -50,7 +50,8 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     post_expired_rejected/1,
     tagging_roundtrip/1,
     tagging_on_write/1,
-    list_encoding_url/1
+    list_encoding_url/1,
+    request_payer_ignored/1
 ]).
 
 all() ->
@@ -92,7 +93,8 @@ all() ->
         post_expired_rejected,
         tagging_roundtrip,
         tagging_on_write,
-        list_encoding_url
+        list_encoding_url,
+        request_payer_ignored
     ].
 
 init_per_suite(Config) ->
@@ -751,6 +753,19 @@ list_encoding_url(Config) ->
         [ok = livery_s3:delete_object(C, B, K) || K <- Keys],
         ok
     end.
+
+%% Requester pays is AWS-only: other stores must still accept the signed
+%% header, including on a presigned URL.
+request_payer_ignored(Config) ->
+    Opts = ?config(opts, Config),
+    B = ?config(bucket, Config),
+    C = livery_s3:new(Opts#{request_payer => requester}),
+    K = uniq(<<"payer-">>),
+    {ok, _} = livery_s3:put_object(C, B, K, <<"paid">>),
+    {ok, #{body := <<"paid">>}} = livery_s3:get_object(C, B, K),
+    {ok, Url} = livery_s3:presign(C, get, B, K, 300),
+    {ok, 200, _, <<"paid">>} = hackney:request(get, Url, [], <<>>, [{with_body, true}]),
+    ok = livery_s3:delete_object(C, B, K).
 
 anon_client(Config) ->
     Opts = ?config(opts, Config),
