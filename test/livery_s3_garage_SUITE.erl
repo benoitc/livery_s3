@@ -47,7 +47,9 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     post_upload/1,
     post_upload_filename/1,
     post_too_large_rejected/1,
-    post_expired_rejected/1
+    post_expired_rejected/1,
+    tagging_roundtrip/1,
+    tagging_on_write/1
 ]).
 
 all() ->
@@ -86,7 +88,9 @@ all() ->
         post_upload,
         post_upload_filename,
         post_too_large_rejected,
-        post_expired_rejected
+        post_expired_rejected,
+        tagging_roundtrip,
+        tagging_on_write
     ].
 
 init_per_suite(Config) ->
@@ -682,6 +686,46 @@ post_form(#{url := Url, fields := Fields}, Data, ContentType) ->
     {ok, Status, _, RespBody} = hackney:request(post, Url, Headers, Body, [{with_body, true}]),
     {Status, RespBody}.
 
+%%====================================================================
+%% Object tagging
+%%====================================================================
+
+tagging_roundtrip(Config) ->
+    maybe
+        ok ?= require(tagging, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"tag-">>),
+        {ok, _} = livery_s3:put_object(C, B, K, <<"x">>),
+        ?assertEqual({ok, #{}}, livery_s3:get_object_tagging(C, B, K)),
+        Tags = #{<<"team">> => <<"a+b c">>, <<"env">> => <<"prod">>},
+        ok = livery_s3:put_object_tagging(C, B, K, Tags),
+        ?assertEqual({ok, Tags}, livery_s3:get_object_tagging(C, B, K)),
+        ok = livery_s3:put_object_tagging(C, B, K, #{<<"only">> => <<"one">>}),
+        ?assertEqual({ok, #{<<"only">> => <<"one">>}}, livery_s3:get_object_tagging(C, B, K)),
+        ok = livery_s3:delete_object_tagging(C, B, K),
+        ?assertEqual({ok, #{}}, livery_s3:get_object_tagging(C, B, K)),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
+%% Tags set at write time, kept by a plain copy and replaced by a tagged one.
+tagging_on_write(Config) ->
+    maybe
+        ok ?= require(tagging, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"tag-w-">>),
+        Kept = uniq(<<"tag-kept-">>),
+        Replaced = uniq(<<"tag-repl-">>),
+        Tags = #{<<"a b">> => <<"1=2/3+4">>},
+        {ok, _} = livery_s3:put_object(C, B, K, <<"x">>, #{tagging => Tags}),
+        ?assertEqual({ok, Tags}, livery_s3:get_object_tagging(C, B, K)),
+        {ok, _} = livery_s3:copy_object(C, B, K, B, Kept),
+        ?assertEqual({ok, Tags}, livery_s3:get_object_tagging(C, B, Kept)),
+        {ok, _} = livery_s3:copy_object(C, B, K, B, Replaced, #{tagging => #{<<"n">> => <<"v">>}}),
+        ?assertEqual({ok, #{<<"n">> => <<"v">>}}, livery_s3:get_object_tagging(C, B, Replaced)),
+        [ok = livery_s3:delete_object(C, B, X) || X <- [K, Kept, Replaced]],
+        ok
+    end.
+
 anon_client(Config) ->
     Opts = ?config(opts, Config),
     livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
@@ -706,12 +750,13 @@ backend() ->
 %% server; a testcase for a missing capability skips instead of passing silently.
 %%
 %% Garage: no anonymous S3 API access (public reads go through its website
-%% endpoint), and it accepts SSE-S3/SSE-KMS headers without encrypting.
+%% endpoint), it accepts SSE-S3/SSE-KMS headers without encrypting, and object
+%% tagging is NotImplemented.
 %% MinIO: refuses SSE-C over plain HTTP, and the test container has no TLS.
 capabilities(garage) ->
     [checksums, sse_c, post_object];
 capabilities(minio) ->
-    [anonymous, checksums, sse_s3, sse_kms, post_object].
+    [anonymous, checksums, sse_s3, sse_kms, post_object, tagging].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->

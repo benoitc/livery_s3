@@ -42,6 +42,10 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
 -export([head_object/3, head_object/4]).
 -export([delete_object/3, delete_object/4]).
 -export([copy_object/5, copy_object/6]).
+%% Object tagging.
+-export([put_object_tagging/4, put_object_tagging/5]).
+-export([get_object_tagging/3, get_object_tagging/4]).
+-export([delete_object_tagging/3, delete_object_tagging/4]).
 %% Buckets.
 -export([list_buckets/1]).
 -export([create_bucket/2, create_bucket/3]).
@@ -84,6 +88,7 @@ as `{error, {s3, Code, Message, #{status => S, request_id => RId}}}`.
     | term().
 -type bucket() :: binary().
 -type key() :: binary().
+-type tags() :: #{binary() => binary()}.
 -type body() :: iodata() | {full, iodata()} | {stream, fun(() -> eof | {ok, binary(), fun()})}.
 %% A completed part: number and ETag, plus the checksums of the part when the
 %% upload was created with a checksum algorithm.
@@ -326,8 +331,9 @@ put_object(Client, Bucket, Key, Body) ->
 
 -doc """
 Upload an object with options: `content_type`, `cache_control`,
-`content_disposition`, `content_encoding`, `storage_class`, `acl`, and
-`metadata` (`#{Name => Value}` mapped to `x-amz-meta-*`).
+`content_disposition`, `content_encoding`, `storage_class`, `acl`,
+`metadata` (`#{Name => Value}` mapped to `x-amz-meta-*`), and `tagging`
+(`#{Key => Value}` object tags).
 
 Conditional writes (backend-dependent): `if_none_match => <<"*">>` puts only if
 the object does not exist, `if_match => ETag` only if it matches; a failed
@@ -449,8 +455,10 @@ copy_object(Client, SrcBucket, SrcKey, DstBucket, DstKey) ->
 -doc """
 Server-side copy of `SrcBucket/SrcKey` to `DstBucket/DstKey`. `Opts` accepts the
 same write options as `put_object/5`, including encryption of the copy;
-supplying `metadata` switches the metadata directive to `REPLACE`. An SSE-C
-source needs `copy_source_sse_customer_key`.
+supplying `metadata` switches the metadata directive to `REPLACE`, and
+supplying `tagging` switches the tagging directive to `REPLACE` (otherwise the
+copy keeps the source's tags). An SSE-C source needs
+`copy_source_sse_customer_key`.
 """.
 -spec copy_object(client(), bucket(), key(), bucket(), key(), map()) ->
     {ok, map()} | {error, reason()}.
@@ -463,13 +471,57 @@ copy_object(Client, SrcBucket, SrcKey, DstBucket, DstKey, Opts) ->
             | object_write_headers(Opts) ++ Sse ++ SrcSse
         ],
         Headers =
-            case maps:is_key(metadata, Opts) of
-                true -> [{<<"x-amz-metadata-directive">>, <<"REPLACE">>} | Headers0];
-                false -> Headers0
-            end,
+            replace_directive(<<"x-amz-tagging-directive">>, tagging, Opts) ++
+                replace_directive(<<"x-amz-metadata-directive">>, metadata, Opts) ++ Headers0,
         {ok, Resp} ?= request(Client, put, DstBucket, DstKey, [], Headers, empty, #{}),
         on_result_xml(Resp, <<"CopyObjectResult">>, fun copy_result/2)
     end.
+
+%%====================================================================
+%% Object tagging
+%%====================================================================
+
+-doc "Replace an object's tag set. See `put_object_tagging/5`.".
+-spec put_object_tagging(client(), bucket(), key(), tags()) -> ok | {error, reason()}.
+put_object_tagging(Client, Bucket, Key, Tags) ->
+    put_object_tagging(Client, Bucket, Key, Tags, #{}).
+
+-doc """
+Replace the tag set of an object (or of `version_id`) with `Tags`, a map of tag
+key to value. S3 allows up to 10 tags per object. Tags can also be set at write
+time with the `tagging` option of `put_object/5`.
+""".
+-spec put_object_tagging(client(), bucket(), key(), tags(), map()) -> ok | {error, reason()}.
+put_object_tagging(Client, Bucket, Key, Tags, Opts) ->
+    Body = build_tagging_xml(Tags),
+    Query = [{<<"tagging">>, <<>>} | version_query(Opts)],
+    Headers = [{<<"content-md5">>, base64:encode(crypto:hash(md5, Body))}],
+    expect_ok(request(Client, put, Bucket, Key, Query, Headers, {full, Body}, #{})).
+
+-doc "Read an object's tags. See `get_object_tagging/4`.".
+-spec get_object_tagging(client(), bucket(), key()) -> {ok, tags()} | {error, reason()}.
+get_object_tagging(Client, Bucket, Key) ->
+    get_object_tagging(Client, Bucket, Key, #{}).
+
+-doc "Read the tags of an object (or of `version_id`) as `#{Key => Value}`.".
+-spec get_object_tagging(client(), bucket(), key(), map()) -> {ok, tags()} | {error, reason()}.
+get_object_tagging(Client, Bucket, Key, Opts) ->
+    Query = [{<<"tagging">>, <<>>} | version_query(Opts)],
+    case request(Client, get, Bucket, Key, Query, [], empty, #{}) of
+        {ok, Resp} -> on_2xx(Resp, fun(R) -> {ok, parse_tagging(R)} end);
+        {error, _} = E -> E
+    end.
+
+-doc "Remove every tag from an object. See `delete_object_tagging/4`.".
+-spec delete_object_tagging(client(), bucket(), key()) -> ok | {error, reason()}.
+delete_object_tagging(Client, Bucket, Key) ->
+    delete_object_tagging(Client, Bucket, Key, #{}).
+
+-doc "Remove every tag from an object (or from `version_id`).".
+-spec delete_object_tagging(client(), bucket(), key(), map()) -> ok | {error, reason()}.
+delete_object_tagging(Client, Bucket, Key, Opts) ->
+    Query = [{<<"tagging">>, <<>>} | version_query(Opts)],
+    expect_ok(request(Client, delete, Bucket, Key, Query, [], empty, #{})).
 
 %%====================================================================
 %% Buckets
@@ -1234,8 +1286,31 @@ object_write_headers(Opts) ->
         opt_header(<<"content-encoding">>, content_encoding, Opts),
         opt_header(<<"x-amz-storage-class">>, storage_class, Opts),
         opt_header(<<"x-amz-acl">>, acl, Opts),
+        tagging_header(Opts),
         meta_headers(Opts)
     ]).
+
+%% `tagging => #{K => V}` on a write, sent as a URL-encoded query string.
+-spec tagging_header(map()) -> [{binary(), binary()}].
+tagging_header(Opts) ->
+    case maps:get(tagging, Opts, undefined) of
+        undefined ->
+            [];
+        Tags ->
+            Pairs = [
+                <<(livery_s3_uri:encode(K))/binary, "=", (livery_s3_uri:encode(V))/binary>>
+             || {K, V} <- lists:sort(maps:to_list(Tags))
+            ],
+            [{<<"x-amz-tagging">>, iolist_to_binary(lists:join(<<"&">>, Pairs))}]
+    end.
+
+%% A copy keeps the source's metadata/tags unless new ones are supplied.
+-spec replace_directive(binary(), atom(), map()) -> [{binary(), binary()}].
+replace_directive(Header, Opt, Opts) ->
+    case maps:is_key(Opt, Opts) of
+        true -> [{Header, <<"REPLACE">>}];
+        false -> []
+    end.
 
 -spec checksum_mode_header(map()) -> [{binary(), binary()}].
 checksum_mode_header(Opts) ->
@@ -1394,6 +1469,24 @@ delete_object_xml({Key, VersionId}) ->
     >>;
 delete_object_xml(Key) when is_binary(Key) ->
     <<"<Object><Key>", (xml_escape(Key))/binary, "</Key></Object>">>.
+
+-spec build_tagging_xml(tags()) -> binary().
+build_tagging_xml(Tags) ->
+    Items = <<
+        <<"<Tag><Key>", (xml_escape(K))/binary, "</Key><Value>", (xml_escape(V))/binary,
+            "</Value></Tag>">>
+     || {K, V} <- lists:sort(maps:to_list(Tags))
+    >>,
+    <<?XML_DECL/binary, "<Tagging><TagSet>", Items/binary, "</TagSet></Tagging>">>.
+
+-spec parse_tagging(livery_client:response()) -> tags().
+parse_tagging(Resp) ->
+    {ok, Tree} = parse_body(Resp),
+    TagSet = default(livery_s3_xml:child(Tree, <<"TagSet">>), {<<"TagSet">>, [], []}),
+    maps:from_list([
+        {livery_s3_xml:text(T, <<"Key">>), default(livery_s3_xml:text(T, <<"Value">>), <<>>)}
+     || T <- livery_s3_xml:children(TagSet, <<"Tag">>)
+    ]).
 
 -spec build_complete_xml([part()]) -> binary().
 build_complete_xml(Parts) ->
