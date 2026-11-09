@@ -39,7 +39,11 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     anonymous_denied_on_private/1,
     checksum_roundtrip/1,
     checksum_mismatch_rejected/1,
-    checksum_multipart/1
+    checksum_multipart/1,
+    sse_c_roundtrip/1,
+    sse_c_copy/1,
+    sse_s3_roundtrip/1,
+    sse_kms_roundtrip/1
 ]).
 
 all() ->
@@ -70,7 +74,11 @@ all() ->
         anonymous_denied_on_private,
         checksum_roundtrip,
         checksum_mismatch_rejected,
-        checksum_multipart
+        checksum_multipart,
+        sse_c_roundtrip,
+        sse_c_copy,
+        sse_s3_roundtrip,
+        sse_kms_roundtrip
     ].
 
 init_per_suite(Config) ->
@@ -516,6 +524,74 @@ checksum_multipart(Config) ->
         ok = livery_s3:delete_object(C, B, K)
     end.
 
+%%====================================================================
+%% Server-side encryption
+%%====================================================================
+
+-define(SSE_KEY, <<"0123456789abcdef0123456789abcdef">>).
+-define(SSE_KEY2, <<"fedcba9876543210fedcba9876543210">>).
+
+%% SSE-C: the object reads back only with the key it was written with.
+sse_c_roundtrip(Config) ->
+    maybe
+        ok ?= require(sse_c, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"ssec-">>),
+        Opts = #{sse_customer_key => ?SSE_KEY},
+        {ok, Put} = livery_s3:put_object(C, B, K, <<"sealed">>, Opts),
+        ct:pal("SSE-C put -> ~p", [Put]),
+        {ok, #{body := <<"sealed">>}} = livery_s3:get_object(C, B, K, Opts),
+        {ok, Meta} = livery_s3:head_object(C, B, K, Opts),
+        ?assertEqual(<<"AES256">>, maps:get(sse_customer_algorithm, Meta)),
+        NoKey = livery_s3:get_object(C, B, K),
+        WrongKey = livery_s3:get_object(C, B, K, #{sse_customer_key => ?SSE_KEY2}),
+        ct:pal("SSE-C get without key -> ~p~nwith wrong key -> ~p", [NoKey, WrongKey]),
+        ?assertMatch({error, {s3, _, _, _}}, NoKey),
+        ?assertMatch({error, {s3, _, _, _}}, WrongKey),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
+%% A copy reads the SSE-C source with its key and re-encrypts with a new one.
+sse_c_copy(Config) ->
+    maybe
+        ok ?= require(sse_c, Config),
+        {C, B} = ctx(Config),
+        Src = uniq(<<"ssec-src-">>),
+        Dst = uniq(<<"ssec-dst-">>),
+        {ok, _} = livery_s3:put_object(C, B, Src, <<"rekeyed">>, #{sse_customer_key => ?SSE_KEY}),
+        {ok, _} = livery_s3:copy_object(C, B, Src, B, Dst, #{
+            copy_source_sse_customer_key => ?SSE_KEY, sse_customer_key => ?SSE_KEY2
+        }),
+        {ok, #{body := <<"rekeyed">>}} =
+            livery_s3:get_object(C, B, Dst, #{sse_customer_key => ?SSE_KEY2}),
+        ok = livery_s3:delete_object(C, B, Src),
+        ok = livery_s3:delete_object(C, B, Dst)
+    end.
+
+sse_s3_roundtrip(Config) ->
+    maybe
+        ok ?= require(sse_s3, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"sses3-">>),
+        {ok, Put} = livery_s3:put_object(C, B, K, <<"managed">>, #{sse => aes256}),
+        ?assertEqual(<<"AES256">>, maps:get(sse, Put)),
+        {ok, #{sse := <<"AES256">>}} = livery_s3:head_object(C, B, K),
+        {ok, #{body := <<"managed">>}} = livery_s3:get_object(C, B, K),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
+sse_kms_roundtrip(Config) ->
+    maybe
+        ok ?= require(sse_kms, Config),
+        {C, B} = ctx(Config),
+        K = uniq(<<"ssekms-">>),
+        {ok, Put} = livery_s3:put_object(C, B, K, <<"kms">>, #{sse => {kms, <<"livery-s3-key">>}}),
+        ct:pal("SSE-KMS put -> ~p", [Put]),
+        {ok, #{sse := <<"aws:kms">>}} = livery_s3:head_object(C, B, K),
+        {ok, #{body := <<"kms">>}} = livery_s3:get_object(C, B, K),
+        ok = livery_s3:delete_object(C, B, K)
+    end.
+
 anon_client(Config) ->
     Opts = ?config(opts, Config),
     livery_s3:new((maps:without([access_key_id, secret_access_key], Opts))#{
@@ -538,10 +614,14 @@ backend() ->
 
 %% Features each store implements. Every entry was checked against the real
 %% server; a testcase for a missing capability skips instead of passing silently.
+%%
+%% Garage: no anonymous S3 API access (public reads go through its website
+%% endpoint), and it accepts SSE-S3/SSE-KMS headers without encrypting.
+%% MinIO: refuses SSE-C over plain HTTP, and the test container has no TLS.
 capabilities(garage) ->
-    [checksums];
+    [checksums, sse_c];
 capabilities(minio) ->
-    [anonymous, checksums].
+    [anonymous, checksums, sse_s3, sse_kms].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->
