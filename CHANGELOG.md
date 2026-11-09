@@ -24,8 +24,11 @@ semantic versioning.
   bucket owned by another account.
 
 ### Changed
-- `make test` and `make test-minio` now fail when the integration suite fails.
+- `make test` and `make test-rustfs` now fail when the integration suite fails.
   Before, a failing run still exited successfully.
+- RustFS replaces MinIO as the second integration target, next to Garage.
+  MinIO no longer publishes container images that can be pulled, so the MinIO
+  runs could not start. `make test-minio` is now `make test-rustfs`.
 
 ## 0.2.1 - 2026-09-21
 

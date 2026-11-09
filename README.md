@@ -130,19 +130,19 @@ rebar3 eunit
 ```
 
 Integration tests run against a real [Garage](https://garagehq.deuxfleurs.fr/)
-and [MinIO](https://min.io/) in Docker. The two stores implement different
+and [RustFS](https://rustfs.com/) in Docker. The two stores implement different
 subsets of S3, so the suite runs against both, and a target fails when a test
 fails:
 
 ```
 make test            # Garage: garage-up -> rebar3 ct -> garage-down
-make test-minio      # MinIO, same suite
+make test-rustfs     # RustFS, same suite
 make test-all        # both
 ```
 
-`LIVERY_S3_BACKEND` (`garage` or `minio`) selects the capability table in the
-suite: a test for a feature the store lacks (tagging on Garage, SSE-C over plain
-HTTP on MinIO, ...) is skipped, not passed.
+`LIVERY_S3_BACKEND` (`garage` or `rustfs`) selects the capability table in the
+suite: a test for a feature the store lacks (tagging or anonymous access on
+Garage, control characters in keys on RustFS, ...) is skipped, not passed.
 
 or manually:
 

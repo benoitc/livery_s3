@@ -290,7 +290,10 @@ multipart_complete_conditional_fresh(Config) ->
 
 %% A dead upload id is not the if_match-lost-to-delete race, so it must keep
 %% its S3 error code even though the request carries a conditional header.
-%% This needs no conditional-write support, so it is strict on every store.
+%% `if_none_match` on an absent key holds whichever check a store runs first,
+%% so the dead upload is the only possible failure on every store. (An
+%% `if_match` here would let a store that checks the key first answer
+%% NoSuchKey, which is also correct.)
 multipart_complete_no_such_upload(Config) ->
     {C, B} = ctx(Config),
     K = uniq(<<"mpu-dead-">>),
@@ -298,9 +301,9 @@ multipart_complete_no_such_upload(Config) ->
     {ok, #{etag := ETag}} = livery_s3:upload_part(C, B, K, UploadId, 1, binary:copy(<<"a">>, 100)),
     ok = livery_s3:abort_multipart_upload(C, B, K, UploadId),
     Result = livery_s3:complete_multipart_upload(C, B, K, UploadId, [{1, ETag}], #{
-        if_match => <<"\"deadbeef\"">>
+        if_none_match => <<"*">>
     }),
-    ct:pal("dead upload id + if_match -> ~p", [Result]),
+    ct:pal("dead upload id + if_none_match -> ~p", [Result]),
     ?assertNotEqual({error, not_found}, Result),
     ?assertMatch({error, {s3, _, _, _}}, Result).
 
@@ -601,9 +604,11 @@ sse_kms_roundtrip(Config) ->
         ok ?= require(sse_kms, Config),
         {C, B} = ctx(Config),
         K = uniq(<<"ssekms-">>),
-        {ok, Put} = livery_s3:put_object(C, B, K, <<"kms">>, #{sse => {kms, <<"livery-s3-key">>}}),
+        %% The store's default KMS key: the test needs no key id.
+        {ok, Put} = livery_s3:put_object(C, B, K, <<"kms">>, #{sse => {kms, undefined}}),
         ct:pal("SSE-KMS put -> ~p", [Put]),
-        {ok, #{sse := <<"aws:kms">>}} = livery_s3:head_object(C, B, K),
+        {ok, #{sse := <<"aws:kms">>} = Meta} = livery_s3:head_object(C, B, K),
+        ?assert(is_binary(maps:get(sse_kms_key_id, Meta))),
         {ok, #{body := <<"kms">>}} = livery_s3:get_object(C, B, K),
         ok = livery_s3:delete_object(C, B, K)
     end.
@@ -734,13 +739,19 @@ tagging_on_write(Config) ->
 %% encoding-type=url listings
 %%====================================================================
 
-%% Keys with a newline, a space, a plus, and non-ASCII come back intact.
+%% Keys with a space, a plus, a literal percent escape, and non-ASCII come back
+%% intact, plus a newline where the store accepts control characters in keys.
 list_encoding_url(Config) ->
     maybe
         ok ?= require(encoding_url, Config),
         {C, B} = ctx(Config),
         Prefix = <<(uniq(<<"enc-">>))/binary, "/">>,
-        Names = [<<"line\nbreak">>, <<"sp ace+plus">>, <<"caf", 16#C3, 16#A9>>],
+        Control =
+            case require(control_char_keys, Config) of
+                ok -> [<<"line\nbreak">>];
+                {skip, _} -> []
+            end,
+        Names = Control ++ [<<"sp ace+plus">>, <<"pct%2F">>, <<"caf", 16#C3, 16#A9>>],
         Keys = lists:sort([<<Prefix/binary, N/binary>> || N <- Names]),
         [{ok, _} = livery_s3:put_object(C, B, K, <<"v">>) || K <- Keys],
         {ok, #{objects := Objects}} =
@@ -783,7 +794,7 @@ ctx(Config) ->
 %% Which store the suite runs against; selects the capability table below.
 backend() ->
     case os:getenv("LIVERY_S3_BACKEND") of
-        "minio" -> minio;
+        "rustfs" -> rustfs;
         _ -> garage
     end.
 
@@ -793,11 +804,11 @@ backend() ->
 %% Garage: no anonymous S3 API access (public reads go through its website
 %% endpoint), it accepts SSE-S3/SSE-KMS headers without encrypting, and object
 %% tagging is NotImplemented.
-%% MinIO: refuses SSE-C over plain HTTP, and the test container has no TLS.
+%% RustFS: rejects control characters in object keys.
 capabilities(garage) ->
-    [checksums, sse_c, post_object, encoding_url];
-capabilities(minio) ->
-    [anonymous, checksums, sse_s3, sse_kms, post_object, tagging, encoding_url].
+    [checksums, sse_c, post_object, encoding_url, control_char_keys];
+capabilities(rustfs) ->
+    [anonymous, checksums, sse_c, sse_s3, sse_kms, post_object, tagging, encoding_url].
 
 %% Skip the calling testcase when the backend lacks `Cap`.
 require(Cap, Config) ->
