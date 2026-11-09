@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## Unreleased
+
+### Added
+- Anonymous access: a client built with `credentials => anonymous` sends
+  requests unsigned, so you can read public buckets without keys.
+- Integrity checksums: uploads can carry a CRC32, CRC32C, SHA1 or SHA256
+  checksum that the store verifies, including per part on multipart uploads,
+  and reads can return the stored checksum.
+- Server-side encryption with store-managed keys (SSE-S3), KMS keys (SSE-KMS),
+  or your own keys (SSE-C), on uploads, reads, copies and multipart uploads.
+- Presigned POST: browser form uploads straight to a bucket, under a signed
+  policy that can cap the file size and restrict the key and content type.
+- Object tagging: set tags at write time, and replace, read or remove them
+  later. Copies keep the source's tags unless you give new ones.
+- Listings can ask the store to URL-encode keys, for keys holding characters
+  XML cannot carry. The result still holds the original keys.
+- Client options for AWS Requester Pays buckets and for rejecting requests to a
+  bucket owned by another account.
+
+### Changed
+- `make test` and `make test-minio` now fail when the integration suite fails.
+  Before, a failing run still exited successfully.
+
 ## 0.2.1 - 2026-09-21
 
 Maintenance release: dependency updates.
