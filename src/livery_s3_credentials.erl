@@ -11,6 +11,9 @@ sources (EC2/ECS instance metadata, web-identity/STS, custom funs) become a
 `{dynamic, _, _}` handle whose credentials are fetched lazily and cached by
 `livery_s3_credentials_store`, which refreshes them before `expires_at`.
 
+The `anonymous` provider carries no credentials: requests go out unsigned, for
+public buckets. It is never picked by the `default` chain.
+
 The credentials themselves (key, secret, optional session token) feed SigV4 and
 work against any S3-compatible store; the providers are environment-specific
 (env/file/static everywhere, IMDS on AWS, web-identity on AWS or MinIO STS).
@@ -26,7 +29,8 @@ work against any S3-compatible store; the providers are environment-specific
     expires_at => integer()
 }.
 -type provider() ::
-    {static, binary(), binary(), binary() | undefined}
+    anonymous
+    | {static, binary(), binary(), binary() | undefined}
     | env
     | {file, binary()}
     | imds
@@ -35,7 +39,7 @@ work against any S3-compatible store; the providers are environment-specific
     | default
     | fun(() -> {ok, creds()} | {error, term()})
     | {module(), atom(), [term()]}.
--opaque handle() :: {fixed, creds()} | {dynamic, term(), provider()}.
+-opaque handle() :: anonymous | {fixed, creds()} | {dynamic, term(), provider()}.
 
 %%====================================================================
 %% Handle lifecycle
@@ -46,6 +50,8 @@ Turn a provider into a handle. One-shot providers resolve now (and may fail);
 refreshing providers return a lazy handle that fetches on first use.
 """.
 -spec prepare(provider()) -> {ok, handle()} | {error, term()}.
+prepare(anonymous) ->
+    {ok, anonymous};
 prepare({static, AccessKey, Secret, Token}) ->
     {ok, {fixed, creds(AccessKey, Secret, Token)}};
 prepare(env) ->
@@ -73,8 +79,14 @@ prepare({Mod, Fun, Args} = Provider) when is_atom(Mod), is_atom(Fun), is_list(Ar
 prepare(Other) ->
     {error, {invalid_credentials_provider, Other}}.
 
--doc "Return the current credentials for a handle, refreshing if needed.".
--spec current(handle()) -> {ok, creds()} | {error, term()}.
+-doc """
+Return the current credentials for a handle, refreshing if needed. An
+`anonymous` handle has no credentials and returns `anonymous`: the request is
+sent unsigned.
+""".
+-spec current(handle()) -> {ok, creds()} | anonymous | {error, term()}.
+current(anonymous) ->
+    anonymous;
 current({fixed, Creds}) ->
     {ok, Creds};
 current({dynamic, Key, Provider}) ->

@@ -10,6 +10,7 @@ Used two ways:
   `host`/`x-amz-date`/`x-amz-content-sha256` (and `x-amz-security-token` when a
   session token is configured), signs `host` plus every `x-amz-*` header, and
   adds the `authorization` header before handing the request to the transport.
+  An anonymous client's requests pass through unsigned.
 * As a presigner (`presigned_url/8`): query-string signing for time-limited
   GET/PUT URLs, with `UNSIGNED-PAYLOAD` and `host` as the only signed header.
 
@@ -49,6 +50,7 @@ it is exercised against AWS's published S3 worked examples in the tests.
 call(Req, Next, Cfg) ->
     case livery_s3_credentials:current(Cfg#s3_config.credentials) of
         {ok, Creds} -> sign_request(Req, Next, Cfg, Creds);
+        anonymous -> Next(Req);
         {error, Reason} -> {error, {credentials, Reason}}
     end.
 
