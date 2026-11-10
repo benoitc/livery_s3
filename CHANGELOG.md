@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
-## Unreleased
+## 0.3.1 - 2026-11-10
 
 ### Fixed
 - Streamed uploads now work on AWS and RustFS. A `{stream, Producer}` body was
@@ -18,6 +18,8 @@ semantic versioning.
   `{error, content_length_required}` before anything is sent, on every store.
   Garage used to accept it, so code relying on that has to pass the length.
   For data of unknown size, use a multipart upload.
+- Requires `hackney` `~> 4.10.2`, the first release that sends a streamed
+  body with its declared length.
 
 ## 0.3.0 - 2026-11-10
 
