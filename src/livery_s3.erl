@@ -347,7 +347,10 @@ presign_post(#s3_client{config = Cfg}, Bucket, Key, Expires, Opts) ->
 %% Objects
 %%====================================================================
 
--doc "Upload an object. `Body` is `iodata()` or a `{stream, Producer}` body.".
+-doc """
+Upload an object. `Body` is `iodata()` or a `{stream, Producer}` body; a stream
+needs `content_length` (see `put_object/5`).
+""".
 -spec put_object(client(), bucket(), key(), body()) -> {ok, map()} | {error, reason()}.
 put_object(Client, Bucket, Key, Body) ->
     put_object(Client, Bucket, Key, Body, #{}).
@@ -362,6 +365,12 @@ Conditional writes (backend-dependent): `if_none_match => <<"*">>` puts only if
 the object does not exist, `if_match => ETag` only if it matches; a failed
 precondition yields `{error, precondition_failed}`. `content_md5 => true` adds a
 base64 `Content-MD5` integrity header (full-body uploads only).
+
+A `{stream, Producer}` body needs `content_length => Bytes`, sent as
+`Content-Length`: AWS and RustFS refuse an upload without it, so a stream
+without it returns `{error, content_length_required}` before anything is sent.
+For data of unknown size, use a multipart upload. A `Producer` that yields more
+or fewer bytes than declared fails the request.
 
 Integrity checksums: `checksum => crc32 | crc32c | sha1 | sha256` computes the
 value over a full body and sends it as `x-amz-checksum-<alg>`; the store
@@ -379,11 +388,12 @@ SSE-C object needs the same key on every later read. The result carries `sse`,
 put_object(Client, Bucket, Key, Body, Opts) ->
     Body1 = to_body(Body),
     maybe
+        {ok, Length} ?= length_header(Opts, Body1),
         {ok, Sums} ?= livery_s3_checksum:headers(Opts, Body1),
         {ok, Sse} ?= livery_s3_sse:write_headers(Opts),
         Headers =
             object_write_headers(Opts) ++ conditional_headers(Opts) ++
-                md5_headers(Opts, Body1) ++ Sums ++ Sse,
+                md5_headers(Opts, Body1) ++ Sums ++ Sse ++ Length,
         {ok, Resp} ?= request(Client, put, Bucket, Key, [], Headers, Body1, #{}),
         case livery_client:status(Resp) of
             S when S >= 200, S < 300 -> {ok, write_result(Resp)};
@@ -751,8 +761,9 @@ upload_part(Client, Bucket, Key, UploadId, PartNumber, Body) ->
 
 -doc """
 Upload one part (1-based `PartNumber`). `Opts` accepts `checksum` (as in
-`put_object/5`) and the upload's `sse_customer_key`. Returns `#{etag => _}`,
-plus `checksum` when the store echoes one.
+`put_object/5`), the upload's `sse_customer_key`, and `content_length`, which a
+`{stream, Producer}` part needs. Returns `#{etag => _}`, plus `checksum` when
+the store echoes one.
 """.
 -spec upload_part(client(), bucket(), key(), binary(), pos_integer(), body(), map()) ->
     {ok, map()} | {error, reason()}.
@@ -760,9 +771,11 @@ upload_part(Client, Bucket, Key, UploadId, PartNumber, Body, Opts) ->
     Body1 = to_body(Body),
     Query = [{<<"partNumber">>, integer_to_binary(PartNumber)}, {<<"uploadId">>, UploadId}],
     maybe
+        {ok, Length} ?= length_header(Opts, Body1),
         {ok, Sums} ?= livery_s3_checksum:headers(Opts, Body1),
         {ok, Sse} ?= livery_s3_sse:customer_headers(Opts),
-        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Sums ++ Sse, Body1, #{}),
+        Headers = Sums ++ Sse ++ Length,
+        {ok, Resp} ?= request(Client, put, Bucket, Key, Query, Headers, Body1, #{}),
         on_2xx(Resp, fun(R) ->
             {ok, add_checksum(#{etag => unquote(livery_client:header(<<"etag">>, R, <<>>))}, R)}
         end)
@@ -1401,6 +1414,21 @@ response_query(Opts) ->
         opt_query(<<"response-content-language">>, response_content_language, Opts),
         opt_query(<<"response-expires">>, response_expires, Opts)
     ]).
+
+%% A streamed body is sent with the length the caller declares. S3 stores that
+%% follow AWS refuse an upload without Content-Length, so a stream without one
+%% is refused here, before anything is sent. A full body's length is known and
+%% set by the transport.
+-spec length_header(map(), {full, iodata()} | {stream, fun()}) ->
+    {ok, [{binary(), binary()}]} | {error, term()}.
+length_header(Opts, {stream, _}) ->
+    case maps:get(content_length, Opts, undefined) of
+        N when is_integer(N), N >= 0 -> {ok, [{<<"content-length">>, integer_to_binary(N)}]};
+        undefined -> {error, content_length_required};
+        Other -> {error, {invalid_content_length, Other}}
+    end;
+length_header(_Opts, {full, _}) ->
+    {ok, []}.
 
 -spec md5_headers(map(), {full, iodata()} | {stream, fun()}) -> [{binary(), binary()}].
 md5_headers(Opts, {full, Data}) ->
