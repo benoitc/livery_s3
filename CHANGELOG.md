@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## Unreleased
+
+### Fixed
+- Streamed uploads now work on AWS and RustFS. A `{stream, Producer}` body was
+  sent without a `Content-Length`, so those stores refused it with
+  `411 MissingContentLength`. Pass the size with the new `content_length`
+  option on `put_object` and `upload_part`; the upload then goes out with that
+  length, and a body shorter or longer than declared fails the request.
+
+### Changed
+- A streamed upload without `content_length` now returns
+  `{error, content_length_required}` before anything is sent, on every store.
+  Garage used to accept it, so code relying on that has to pass the length.
+  For data of unknown size, use a multipart upload.
+
 ## 0.3.0 - 2026-11-10
 
 ### Added

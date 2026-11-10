@@ -51,7 +51,10 @@ unreachable the whole suite skips, so a machine without Docker is not a failure.
     tagging_roundtrip/1,
     tagging_on_write/1,
     list_encoding_url/1,
-    request_payer_ignored/1
+    request_payer_ignored/1,
+    stream_upload_with_length/1,
+    stream_upload_without_length/1,
+    stream_upload_short_body/1
 ]).
 
 all() ->
@@ -94,7 +97,10 @@ all() ->
         tagging_roundtrip,
         tagging_on_write,
         list_encoding_url,
-        request_payer_ignored
+        request_payer_ignored,
+        stream_upload_with_length,
+        stream_upload_without_length,
+        stream_upload_short_body
     ].
 
 init_per_suite(Config) ->
@@ -777,6 +783,50 @@ request_payer_ignored(Config) ->
     {ok, Url} = livery_s3:presign(C, get, B, K, 300),
     {ok, 200, _, <<"paid">>} = hackney:request(get, Url, [], <<>>, [{with_body, true}]),
     ok = livery_s3:delete_object(C, B, K).
+
+%%====================================================================
+%% Streamed uploads
+%%====================================================================
+
+%% A streamed body with its declared length goes out with Content-Length, which
+%% stores that follow AWS require (RustFS answers 411 without it).
+stream_upload_with_length(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"stream-up-">>),
+    Chunks = [binary:copy(<<N>>, 65536) || N <- lists:seq(1, 80)],
+    Len = iolist_size(Chunks),
+    {ok, #{etag := _}} = livery_s3:put_object(C, B, K, producer(Chunks), #{content_length => Len}),
+    {ok, #{body := Body}} = livery_s3:get_object(C, B, K),
+    ?assertEqual(iolist_to_binary(Chunks), Body),
+    {ok, U} = livery_s3:create_multipart_upload(C, B, K),
+    {ok, #{etag := E}} = livery_s3:upload_part(C, B, K, U, 1, producer(Chunks), #{
+        content_length => Len
+    }),
+    {ok, _} = livery_s3:complete_multipart_upload(C, B, K, U, [{1, E}]),
+    {ok, #{content_length := Len}} = livery_s3:head_object(C, B, K),
+    ok = livery_s3:delete_object(C, B, K).
+
+stream_upload_without_length(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"stream-nolen-">>),
+    ?assertEqual(
+        {error, content_length_required},
+        livery_s3:put_object(C, B, K, producer([<<"x">>]))
+    ),
+    ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K)).
+
+%% A producer that ends before the declared length fails, and nothing is
+%% stored.
+stream_upload_short_body(Config) ->
+    {C, B} = ctx(Config),
+    K = uniq(<<"stream-short-">>),
+    Result = livery_s3:put_object(C, B, K, producer([<<"only 11 b">>]), #{content_length => 100}),
+    ct:pal("short streamed body -> ~p", [Result]),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual({error, not_found}, livery_s3:head_object(C, B, K)).
+
+producer([]) -> {stream, fun() -> eof end};
+producer([H | T]) -> {stream, fun() -> {ok, H, element(2, producer(T))} end}.
 
 anon_client(Config) ->
     Opts = ?config(opts, Config),

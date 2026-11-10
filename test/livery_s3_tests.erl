@@ -208,7 +208,7 @@ presign_test() ->
 put_object_stream_body_test() ->
     Producer = fun() -> eof end,
     {Req, _} = run(resp(200, [{<<"ETag">>, <<"\"e\"">>}], <<>>), fun(C) ->
-        livery_s3:put_object(C, <<"b">>, <<"k">>, {stream, Producer})
+        livery_s3:put_object(C, <<"b">>, <<"k">>, {stream, Producer}, #{content_length => 0})
     end),
     ?assertMatch({stream, _}, maps:get(body, Req)).
 
@@ -889,7 +889,9 @@ retry_skips_streamed_body_test() ->
         #{retry => #{max => 3, backoff => {1, 1.0}}},
         #{test_pid => self(), counter => Ref, responses => [{error, closed}]}
     ),
-    Result = livery_s3:put_object(C, <<"b">>, <<"k">>, {stream, fun() -> eof end}),
+    Result = livery_s3:put_object(
+        C, <<"b">>, <<"k">>, {stream, fun() -> eof end}, #{content_length => 0}
+    ),
     ?assertEqual(1, length(drain_requests())),
     ?assertEqual({error, closed}, Result).
 

@@ -76,13 +76,15 @@ put_stream_requires_precomputed_test() ->
     Stream = {stream, fun() -> eof end},
     ?assertEqual(
         {error, {checksum_requires_full_body, sha256}},
-        livery_s3:put_object(C, <<"b">>, <<"k">>, Stream, #{checksum => sha256})
+        livery_s3:put_object(C, <<"b">>, <<"k">>, Stream, #{checksum => sha256, content_length => 0})
     ).
 
 put_stream_precomputed_passes_test() ->
     Stream = {stream, fun() -> eof end},
     {Req, _} = run(resp(200, [], <<>>), fun(C) ->
-        livery_s3:put_object(C, <<"b">>, <<"k">>, Stream, #{checksum => {sha256, <<"given">>}})
+        livery_s3:put_object(C, <<"b">>, <<"k">>, Stream, #{
+            checksum => {sha256, <<"given">>}, content_length => 0
+        })
     end),
     ?assertEqual(<<"given">>, header(<<"x-amz-checksum-sha256">>, maps:get(headers, Req))).
 

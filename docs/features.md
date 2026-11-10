@@ -62,7 +62,11 @@ returned as a `metadata` map alongside `content_type`, `content_length`,
   issues a `Range` request and accepts `200` or `206`.
 - `get_object/4` with `stream => true` returns `body => {stream, Reader}`;
   drain it with `livery_client:read/2` or `read_body/1`.
-- Uploads accept a streaming body: pass `{stream, Producer}` as the body.
+- Uploads accept a streaming body: pass `{stream, Producer}` as the body with
+  `content_length => Bytes`. AWS and RustFS refuse an upload without a
+  `Content-Length`, so a stream without `content_length` returns
+  `{error, content_length_required}` and nothing is sent. For data of unknown
+  size, use a multipart upload and pass each part as a full body.
 
 ```erlang
 %% First 1 KiB. Also {Start, eof} and {suffix, N} (last N bytes).
@@ -76,12 +80,14 @@ returned as a `metadata` map alongside `content_type`, `content_length`,
     livery_s3:get_object(C, <<"photos">>, <<"big.bin">>, #{stream => true}),
 {ok, All} = livery_client:read_body(Reader),
 
-%% Streaming upload: the body fun returns eof | {ok, Chunk, NextFun}.
+%% Streaming upload: the body fun returns eof | {ok, Chunk, NextFun}, and you
+%% declare the total size.
 Emit = fun Loop([H | T]) -> {ok, H, fun() -> Loop(T) end};
            Loop([])      -> eof
        end,
 {ok, _} = livery_s3:put_object(C, <<"photos">>, <<"big.bin">>,
-                               {stream, fun() -> Emit(Chunks) end}).
+                               {stream, fun() -> Emit(Chunks) end},
+                               #{content_length => iolist_size(Chunks)}).
 ```
 
 ## Conditional requests and integrity
@@ -130,7 +136,8 @@ requires a checksum.
 
 %% A streamed body is not in memory: pass a value you computed.
 {ok, _} = livery_s3:put_object(C, <<"photos">>, <<"big.bin">>, {stream, Producer},
-                               #{checksum => {sha256, Base64Sha256}}),
+                               #{content_length => Size,
+                                 checksum => {sha256, Base64Sha256}}),
 
 %% Ask for the stored checksum on read, then verify the bytes yourself.
 {ok, #{body := Body, checksum := #{crc32c := Sum}}} =
