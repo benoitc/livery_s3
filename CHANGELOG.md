@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
-## Unreleased
+## 0.3.0 - 2026-11-10
 
 ### Added
 - Anonymous access: a client built with `credentials => anonymous` sends
@@ -24,6 +24,7 @@ semantic versioning.
   bucket owned by another account.
 
 ### Changed
+- Requires `livery` `~> 0.11.0` (tracks 0.11.x), up from 0.10.x.
 - `make test` and `make test-rustfs` now fail when the integration suite fails.
   Before, a failing run still exited successfully.
 - RustFS replaces MinIO as the second integration target, next to Garage.
