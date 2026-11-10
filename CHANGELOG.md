@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## Unreleased
+
+### Changed
+- Requires `livery` 0.12.0 or later (`~> 0.12`), which carries a security fix
+  for signed sign-in cookies. Later 0.x releases of livery are now accepted
+  without a new livery_s3 release.
+
 ## 0.3.1 - 2026-11-10
 
 ### Fixed
