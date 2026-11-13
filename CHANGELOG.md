@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
-## Unreleased
+## 0.3.3 - 2026-11-13
 
 ### Changed
 - Requires `livery` 0.13.0 or later (`~> 0.13`) and `hackney` 4.11.1 or later
