@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## 0.3.4 - 2026-11-18
+
+### Changed
+- Requires `livery` 0.14.0 or later (`~> 0.14`).
+
 ## 0.3.3 - 2026-11-13
 
 ### Changed
